@@ -1,0 +1,167 @@
+#--------------------------------------------------------------------------
+# SPA Name:		Ticket
+# Abstract:		A Simplified Railway Ticket System
+#
+# Service Description:	
+#--------------------------------------------------------------------------
+# FSM(s):
+#               	Diameter_Peer_FSM
+#--------------------------------------------------------------------------
+# History:
+#			2015-03-18  rangt	Created
+#
+#--------------------------------------------------------------------------
+
+version "TICKET15F"
+
+# Distributed and performance test enhancement
+options (distributed,dg_cache=false,spa_timer_limit=200000,keep_on_lead=true)
+#
+#--------------------------------------------------------------------------
+# Global Type Definitions
+#--------------------------------------------------------------------------
+type
+	#Station_Name_enum		enum {
+	#	BEIJING,
+	#	SHANGHAI,
+	#	TIANJIN,
+	#	CHONGQING,
+	#	GUANGZHOU,
+	#	WUHAN,
+	#	ZHENGZHOU,
+	#	TAIYUAN,
+	#	NANJING,
+	#	XIAN
+	#}
+	# Ticket info
+	Ticket_Info_rec record {
+		Train_Number		string(4),
+		Start_Station		string(32),
+		Destination		string(32),
+		Departure_Time		string(4),	# hhmm
+		Arrival_Time		string(4),	# hhmm
+		Duration		string(5),	# hhhmm
+		Price			counter,
+		Total			counter,
+	}
+
+	#Ticket_Amount_rec {
+	#	Train_Number		string(4)	{key},
+	#	Date			string(8),
+	#	Available		counter,
+	#	Reserved		counter,
+	#}
+
+end type
+
+# Global rc
+rc
+	Ticket_Info	table	Ticket_Info_rec
+end rc
+
+rtdb
+	Ticket_Amount_RTDB	table	record {
+		Train_Number__DATE	string(12)	{key},
+		#Date			string(8),
+		Available		counter,
+		Reserved		counter,
+	}
+	
+end rtdb
+
+server
+fsm s_dummy
+end fsm s_dummy
+end server
+
+client
+
+fsm IMOM
+access
+	IMOM_Access_Key		routing_string
+end access
+dynamic
+	#--------------------------------------------------------------------------
+	# fsm IMOM Event Definitions
+	#--------------------------------------------------------------------------
+	End_Call				def_event {}
+end dynamic
+#-------------------------------------------------------------------------------
+# Event		: usli_request
+#
+# Description	: USLI handler that accepts Input Messages (IM's), handles
+#		  the request, and reports status with a corresponding Output
+#		  Message (OM).
+#-------------------------------------------------------------------------------
+event usli_request
+
+##	incr Glb_Service_Measurement_Rec.IMOM_Comand_Received
+##	set IMOM_Start_Timestamp = Glb_Current_Second
+
+#	# Note: the command is case insensitive.
+#
+#	# Reset global Parse_Object subroutine variables.
+#	reset Glb_Parsed
+#	reset Glb_Remainder
+#	reset IMOM_Finish
+#	set IMOM_Input_Message = @.text
+#	set IMOM_Command_Length = length(IMOM_Input_Message)
+#	set IMOM_Call_Instance_ID = "IMOM_" : string(call_index())
+##	set AMA_Called_From_IMOM
+#	# Feature 65502, the content of NOTIFYTXT may have semi-colon(;)
+#	Parse_Object(":", @.text)
+#	set Glb_Parsed = IMOM_Trim(Glb_Parsed)
+#	set IMOM_Command = Glb_Remainder
+#
+#	set IMOM_Command_Prefix = map(Glb_Parsed, "abcdefghijklmnopqrstuvwxyz",
+#		"ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+#	test IMOM_Command_Prefix
+#	# V10SU5 feature 63186
+#	# Add command prefixes for "ADD" and "DEL".
+#	# V10SU7 feature 63749 for VFNL, Add command prefixe for "MOD".
+#	# R28.7 IMR404822 add command prefix for "ADM"
+#	# SP28.5 75229
+#	case any("QRY", "ADJ", "RESET", "UPD", "BUY", "SET", "SCB", "SUB",
+#			"UNSCB", "LIST", "RMV", "CLR", "ADD", "STP", "DEL", "MOD",
+#			"CON", "TOG", "DEBUG", "ACT", "REAU", "ADM","TRANS")
+#		next event IMOM_Format_Check
+#		return
+#	other
+#		# Unknown Command
+#		set IMOM_Output_Message = "Unknown Command!"
+#		next event IMOM_Finish
+#		return
+#	end test
+#
+	if @.text == "test"
+	then
+		send_usli_response(transaction_id = @.transaction_id, code = "OK",text = "Input message accepted! Content=":@.text)
+	else
+		send_usli_response(transaction_id = @.transaction_id, code = "NG",text = "Input message not recognized! Content=":@.text)
+	end if
+
+	return
+
+end event usli_request
+
+# send usli response success event
+event usli_response_succeeded
+	print ("\n usli_request success: ", @)
+	next event End_Call
+	return
+end event usli_response_succeeded
+
+# send usli response fail
+event usli_response_failed
+	print ("\n usli_request failed: ", @)
+	next event End_Call
+	return
+end event usli_response_failed
+
+event End_Call
+	end_call
+end event
+
+end fsm IMOM
+
+end client
