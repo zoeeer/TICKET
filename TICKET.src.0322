@@ -39,7 +39,7 @@ type
 	}
 
 	# Ticket info
-	Train_Info_rec				record {
+	Ticket_Info_rec				record {
 		Train_Number		string(4),
 		Start_Station		string(30),
 		Destination		string(30),
@@ -54,7 +54,7 @@ end type
 
 # Global rc
 rc
-	Ticket_Info			table	Train_Info_rec
+	Ticket_Info			table	Ticket_Info_rec
 end rc
 
 rtdb
@@ -111,12 +111,6 @@ end rtdb
 
 dataview
 
-	request			table	{owner}	record {
-		text			string(200)	{key},
-		result_code		Result_Code,
-		message			string(200),
-	}
-
 	register		table	{owner}	record {
 		text			string(13)	{key},
 		result_code		Result_Code,
@@ -166,9 +160,6 @@ dynamic
 	a_z					string(26)
 	A_Z					string(26)
 
-	PASSWD_MAXLEN				counter
-	PASSWD_CHARS				string
-
 	Glb_SPA_NAME				string
 	Glb_Client_ID				counter
 
@@ -184,9 +175,8 @@ dynamic
 	Glb_RTDB_Operation_Assert_Title		string
 	# end semd om parameters
 
-	Glb_Request_Dataview_Info		Dataview_Info_rec
 	Glb_Register_Dataview_Info		Dataview_Info_rec
-	Glb_Login_Dataview_Info			Dataview_Info_rec
+	Glb_Login_Dataview_Info		Dataview_Info_rec
 	Glb_Return_Val				reason_enum
 
 	Glb_User_Account_RTDB			counter
@@ -204,263 +194,52 @@ dynamic
 	Result					Parse_Result_rec
 	Pos					counter
 end dynamic
-	set Pos = find(Delimiter, Input)
-	if (Pos == 0)
-	then # No Delimiter found in Input String
-		set Result.head = Input
-		reset Result.tail
-	else
-		set Result.head = substring(Input, 1, (Pos - 1))
-		set Result.tail = substring(Input, (Pos + length(Delimiter)), (length(Input)))
-	end if
+    set Pos = find(Delimiter, Input)
+    if (Pos == 0)
+    then # No Delimiter found in Input String
+        set Result.head = Input
+        reset Result.tail
+    else
+        set Result.head = substring(Input, 1, (Pos - 1))
+        set Result.tail = substring(Input, (Pos + length(Delimiter)), (length(Input)))
+    end if
 
-	return (Result)
+    return (Result)
 end def_function Parse
 
 def_function Encrypt (
 	Input					string
 )	string
-dynamic
-	Data					string
-end dynamic
 
-	Data = map(Input, PASSWD_CHARS,
-		"!@#$%ZXCVBNM lkjhgfdsa0987yuiopTREWQ345612mnbvcxz*()DFGHASJKL^&qPwOeIrUtY")
-	return (Data)
+    return (Input)
 end def_function Encrypt
 
 def_function Gen_Session_ID (
 	Input					string
 )	string
 
-	return (Input)
+    return (Input)
 end def_function Gen_Session_ID
 
 initialize
 	set a_z = "abcdefghijklmnopqrstuvwxyz"
 	set A_Z = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-	set PASSWD_MAXLEN = 64
-	set PASSWD_CHARS = a_z:A_Z:"0123456789 !@#$%^&*()"
 
 	set Glb_SPA_NAME = "TICKET"
-		set Glb_RTDB_Data_Assert_Title =
-						"REPT MANUAL ASSERT=103, SPA=" : Glb_SPA_NAME
-	set Glb_EPAY_RC_Assert_Title =
-						"REPT MANUAL ASSERT=104, SPA=" : Glb_SPA_NAME
+        set Glb_RTDB_Data_Assert_Title =
+                        "REPT MANUAL ASSERT=103, SPA=" : Glb_SPA_NAME
+    set Glb_EPAY_RC_Assert_Title =
+                        "REPT MANUAL ASSERT=104, SPA=" : Glb_SPA_NAME
 
-		set Glb_Dynamic_Data_Assert_Title =
-						"REPT INTERNAL ASSERT=302, SPA=" : Glb_SPA_NAME
-		set Glb_Overflow_Assert_Title =
-						"REPT INTERNAL ASSERT=303, SPA=" : Glb_SPA_NAME
-		set Glb_Internal_Operation_Assert_Title =
-						"REPT INTERNAL ASSERT=304, SPA=" : Glb_SPA_NAME
-		set Glb_RTDB_Operation_Assert_Title =
-						"REPT INTERNAL ASSERT=305, SPA=" : Glb_SPA_NAME
+        set Glb_Dynamic_Data_Assert_Title =
+                        "REPT INTERNAL ASSERT=302, SPA=" : Glb_SPA_NAME
+        set Glb_Overflow_Assert_Title =
+                        "REPT INTERNAL ASSERT=303, SPA=" : Glb_SPA_NAME
+        set Glb_Internal_Operation_Assert_Title =
+                        "REPT INTERNAL ASSERT=304, SPA=" : Glb_SPA_NAME
+        set Glb_RTDB_Operation_Assert_Title =
+                        "REPT INTERNAL ASSERT=305, SPA=" : Glb_SPA_NAME
 end initialize
-
-###########################################################################
-# FSM LDAP
-###########################################################################
-fsm LDAP
-access
-	Request_Dataview			routing_string
-end access
-
-call_dynamic
-	BCI_instance				counter
-	BCI_request_id				counter
-end call_dynamic
-
-dynamic
-	#--------------------------------------------------------------------------
-	# FSM LDAP Event Definitions
-	#--------------------------------------------------------------------------
-	Command_Parsing				def_event {
-		text			string,
-	}
-
-	Register				def_event {
-		phone			string,
-		name			string,
-		passwd			string,
-	}
-
-	Register_Result				def_event {
-		result			Result_Code,
-		message			string
-	}
-
-	End_Call				def_event {}
-
-end dynamic
-
-initialize
-	if Request_Dataview != ""
-	then
-		set Glb_Request_Dataview_Info.name = Request_Dataview
-		set Glb_Return_Val = request!attach_owner( Request_Dataview )
-
-		if Glb_Return_Val == e_a_okay
-		then
-			set Glb_Request_Dataview_Info.instance =
-				request!get_instance ( Request_Dataview )
-		else	# attach_owner failed
-			set Glb_Request_Dataview_Info.instance = 0
-		end if
-
-		if Glb_Return_Val == 0
-		then
-			print(Request_Dataview : ": dataview attach failed!\n")
-		end if
-	end if
-end initialize
-
-#-------------------------------------------------------------------------------
-# Dataview Request Handlers
-#
-# Description	: Dataview handler that accepts Input Messages (IM's), handles
-#		  the request, and reports status with a corresponding Output
-#		  Message (OM).
-#-------------------------------------------------------------------------------
-event request!read_received
-	if Glb_Request_Dataview_Info.instance == 0
-	then
-		print(Request_Dataview : ": dataview not running!\n")
-		set Glb_Return_Val = request!send_read_failed(
-			@.instance, @.request_id, e_application_error)
-		next event End_Call
-		return
-	end if
-
-	set BCI_instance = @.instance
-	set BCI_request_id = @.request_id
-
-	set Command_Parsing.text = @.text
-	next event Command_Parsing
-	return
-end event request!read_received
-
-event Command_Parsing
-dynamic
-	Parse_Result				Parse_Result_rec
-	Head					string
-	Remainder				string
-	Option					string
-	Value					string
-end dynamic
-	set Remainder = map( @.text, a_z:" ", A_Z )
-	set Parse_Result = Parse( ":", @.text)
-	set Head = Parse_Result.head
-	set Remainder = Parse_Result.tail
-	test Head
-	case "REGISTER"
-		# Get Options
-		while Remainder != ""
-		do
-			set Parse_Result = Parse( ",", Remainder )
-			set Head = Parse_Result.head
-			set Remainder = Parse_Result.tail
-			set Parse_Result = Parse( "=", Head )
-			set Option = Parse_Result.head
-			set Value = Parse_Result.tail
-			test Option
-			case "PHONE"
-				set Register.phone = Value
-			case "NAME"
-				set Register.name = Value
-			case "PASSWD"
-				set Register.passwd = Value
-			other	# Option not recognized
-				set Register_Result.result = FAIL
-				set Register_Result.message = Option :
-					": option not recognized"
-				next event Register_Result
-				return
-			end test
-		end while
-		next event Register
-		return
-	case "LOGIN"
-		# Get Options
-		while Remainder != ""
-		do
-			set Parse_Result = Parse( ",", Remainder )
-			set Head = Parse_Result.head
-			set Remainder = Parse_Result.tail
-			set Parse_Result = Parse( "=", Head )
-			set Option = Parse_Result.head
-			set Value = Parse_Result.tail
-			test Option
-			case "PHONE"
-				set Account_Retrive.phone = Value
-				set BCI_phone = Value
-			case "PASSWD"
-				set BCI_passwd = Encrypt( Value )
-			other	# Option not recognized
-				set Login_Result.result = FAIL
-				set Login_Result.message = Option :
-					": option not recognized"
-				next event Login_Result
-				return
-			end test
-		end while
-		next event Account_Retrive
-		return
-	other
-		set Register_Result.result = FAIL
-		set Register_Result.message = Head : ": command not recognized"
-		next event Register_Result
-		return
-	end test
-			
-end event Command_Parsing
-
-event Register
-dynamic
-	Account					User_Account_RTDB_fields
-end dynamic
-
-	if length(@.phone) != 13 || map(@.phone, "0123456789", "") == ""
-	then
-		set Register_Result.result = FAIL
-		set Register_Result.message = "phone number format error"
-		next event Register_Result
-		return
-	end if
-
-	set Account.User_ID = @.phone
-	set Account.Passwd = Encrypt( @.passwd )
-	set Account.Name = @.name
-	set Account.Phone = @.phone
-	set Account.Registration_TS = clock()
-
-	User_Account_RTDB!insert( instance = Glb_User_Account_RTDB,
-		data = Account)
-	
-end event Register
-
-event Register_Result
-dynamic
-	Register_Dataview_Rec			register_fields
-	Register_Dataview_Present		register_present
-end dynamic
-	set Register_Dataview_Rec.result_code = @.result
-	set Register_Dataview_Rec.message = @.message
-	set Register_Dataview_Present.result_code
-	set Register_Dataview_Present.message
-	set Glb_Return_Val = register!send_read_completed (
-		BCI_instance, BCI_request_id,
-		Register_Dataview_Rec, Register_Dataview_Present)
-
-	next event End_Call
-	return
-end event Register_Result
-
-event End_Call
-	end_call
-end event End_Call
-
-end fsm LDAP
 
 ###########################################################################
 # FSM REGISTER
@@ -557,7 +336,7 @@ end dynamic
 	set Head = Parse_Result.head
 	set Remainder = Parse_Result.tail
 	test Head
-	case "REGISTER"
+	case "RCHG"
 		# Get Options
 		while Remainder != ""
 		do
@@ -598,18 +377,10 @@ dynamic
 	Account					User_Account_RTDB_fields
 end dynamic
 
-	if length(@.phone) != 13 || map(@.phone, "0123456789", "") != ""
+	if length(@.phone) != 13 || map(@.phone, "0123456789", "") == ""
 	then
 		set Register_Result.result = FAIL
 		set Register_Result.message = "phone number format error"
-		next event Register_Result
-		return
-	end if
-
-	if length(@.passwd) > MAX_PASSWD_LEN || map(@.passwd, PASSWD_CHARS, "") != ""
-	then
-		set Register_Result.result = FAIL
-		set Register_Result.message = "password cannot contain characters other than letters, digits, space and !@#$%^&*()"
 		next event Register_Result
 		return
 	end if
