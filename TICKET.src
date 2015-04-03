@@ -50,6 +50,11 @@ type
 		Total			counter,
 	}
 
+	Call_Info				record {
+		call_id			counter,
+		from_other_client	flag,
+	}
+
 end type
 
 # Global rc
@@ -192,7 +197,29 @@ dynamic
 	Glb_User_Account_RTDB			counter
 	Glb_Session_RTDB			counter
 
-	Dataview_Init_All			def_event {}
+	Glb_Test_Access				counter
+	Glb_Test_Init_Time			counter
+	Glb_Test_INIT_TIMESTAMP			counter
+
+	######################################################
+	# Inter-Fsm events
+	######################################################
+	Test					def_event {
+		command			string,
+		text			string,
+		call_info		Call_Info,
+	}
+
+	Request_Result				def_event {
+		result			Result_Code,
+		message			string
+	}
+
+	######################################################
+	# Initialization events
+	######################################################
+	Test_Init				def_event {}
+	Dataview_Init				def_event {}
 
 end dynamic
 
@@ -224,7 +251,7 @@ dynamic
 	Data					string
 end dynamic
 
-	Data = map(Input, PASSWD_CHARS,
+	set Data = map(Input, PASSWD_CHARS,
 		"!@#$%ZXCVBNM lkjhgfdsa0987yuiopTREWQ345612mnbvcxz*()DFGHASJKL^&qPwOeIrUtY")
 	return (Data)
 end def_function Encrypt
@@ -263,7 +290,7 @@ end initialize
 ###########################################################################
 fsm LDAP
 access
-	Request_Dataview			routing_string
+	Request_Dataview			routing_string_ssn
 end access
 
 call_dynamic
@@ -279,41 +306,38 @@ dynamic
 		text			string,
 	}
 
-	Register				def_event {
-		phone			string,
-		name			string,
-		passwd			string,
-	}
-
-	Register_Result				def_event {
-		result			Result_Code,
-		message			string
-	}
-
 	End_Call				def_event {}
 
 end dynamic
 
 initialize
-	if Request_Dataview != ""
+	schedule( clock = clock() + 5,
+		to = customer_index(),
+		event = Dataview_Init )
+end initialize
+
+event Dataview_Init
+	if Request_Dataview.routing_string != ""
 	then
-		set Glb_Request_Dataview_Info.name = Request_Dataview
-		set Glb_Return_Val = request!attach_owner( Request_Dataview )
+		set Glb_Request_Dataview_Info.name = Request_Dataview.routing_string
+		set Glb_Return_Val = request!attach_owner( Glb_Request_Dataview_Info.name )
 
 		if Glb_Return_Val == e_a_okay
 		then
 			set Glb_Request_Dataview_Info.instance =
-				request!get_instance ( Request_Dataview )
+				request!get_instance ( Glb_Request_Dataview_Info.name )
 		else	# attach_owner failed
 			set Glb_Request_Dataview_Info.instance = 0
 		end if
 
-		if Glb_Return_Val == 0
+		if Glb_Request_Dataview_Info.instance == 0
 		then
-			print(Request_Dataview : ": dataview attach failed!\n")
+			print( Glb_Request_Dataview_Info.name : ": dataview attach failed!\n")
 		end if
 	end if
-end initialize
+
+	end_call
+end event Dataview_Init
 
 #-------------------------------------------------------------------------------
 # Dataview Request Handlers
@@ -325,7 +349,7 @@ end initialize
 event request!read_received
 	if Glb_Request_Dataview_Info.instance == 0
 	then
-		print(Request_Dataview : ": dataview not running!\n")
+		print( Glb_Request_Dataview_Info.name : ": dataview not running!\n")
 		set Glb_Return_Val = request!send_read_failed(
 			@.instance, @.request_id, e_application_error)
 		next event End_Call
@@ -353,7 +377,8 @@ end dynamic
 	set Head = Parse_Result.head
 	set Remainder = Parse_Result.tail
 	test Head
-	case "REGISTER"
+	case "TEST"
+		set Test.command = Head
 		# Get Options
 		while Remainder != ""
 		do
@@ -364,132 +389,83 @@ end dynamic
 			set Option = Parse_Result.head
 			set Value = Parse_Result.tail
 			test Option
-			case "PHONE"
-				set Register.phone = Value
-			case "NAME"
-				set Register.name = Value
-			case "PASSWD"
-				set Register.passwd = Value
+			case "TEXT"
+				set Test.text = Value
 			other	# Option not recognized
-				set Register_Result.result = FAIL
-				set Register_Result.message = Option :
+				set Request_Result.result = FAIL
+				set Request_Result.message = Option :
 					": option not recognized"
-				next event Register_Result
+				next event Request_Result
 				return
 			end test
 		end while
-		next event Register
-		return
-	case "LOGIN"
-		# Get Options
-		while Remainder != ""
-		do
-			set Parse_Result = Parse( ",", Remainder )
-			set Head = Parse_Result.head
-			set Remainder = Parse_Result.tail
-			set Parse_Result = Parse( "=", Head )
-			set Option = Parse_Result.head
-			set Value = Parse_Result.tail
-			test Option
-			case "PHONE"
-				set Account_Retrive.phone = Value
-				set BCI_phone = Value
-			case "PASSWD"
-				set BCI_passwd = Encrypt( Value )
-			other	# Option not recognized
-				set Login_Result.result = FAIL
-				set Login_Result.message = Option :
-					": option not recognized"
-				next event Login_Result
-				return
-			end test
-		end while
-		next event Account_Retrive
+		set Test.call_info.call_id = call_index()
+		set Test.call_info.from_other_client = false
+		send( to = Glb_Test_Access,
+			event = Test,
+			ack = true )
+		print("test if code after an ACTION can be excuted")
 		return
 	other
-		set Register_Result.result = FAIL
-		set Register_Result.message = Head : ": command not recognized"
-		next event Register_Result
+		set Request_Result.result = FAIL
+		set Request_Result.message = Head : ": command not recognized"
+		next event Request_Result
 		return
 	end test
 			
 end event Command_Parsing
 
-event Register
+event send_completed
+end event send_completed
+
+event send_failed
+	set Request_Result.result = FAIL
+	set Request_Result.message = "send request failed: " : string(@.failure_reason)
+	next event Request_Result
+	return
+end event send_failed
+
+event Request_Result
 dynamic
-	Account					User_Account_RTDB_fields
+	Request_Dataview_Rec			request_fields
+	Request_Dataview_Present		request_present
 end dynamic
-
-	if length(@.phone) != 13 || map(@.phone, "0123456789", "") == ""
-	then
-		set Register_Result.result = FAIL
-		set Register_Result.message = "phone number format error"
-		next event Register_Result
-		return
-	end if
-
-	set Account.User_ID = @.phone
-	set Account.Passwd = Encrypt( @.passwd )
-	set Account.Name = @.name
-	set Account.Phone = @.phone
-	set Account.Registration_TS = clock()
-
-	User_Account_RTDB!insert( instance = Glb_User_Account_RTDB,
-		data = Account)
-	
-end event Register
-
-event Register_Result
-dynamic
-	Register_Dataview_Rec			register_fields
-	Register_Dataview_Present		register_present
-end dynamic
-	set Register_Dataview_Rec.result_code = @.result
-	set Register_Dataview_Rec.message = @.message
-	set Register_Dataview_Present.result_code
-	set Register_Dataview_Present.message
-	set Glb_Return_Val = register!send_read_completed (
+	set Request_Dataview_Rec.result_code = @.result
+	set Request_Dataview_Rec.message = @.message
+	set Request_Dataview_Present.result_code
+	set Request_Dataview_Present.message
+	set Glb_Return_Val = request!send_read_completed (
 		BCI_instance, BCI_request_id,
-		Register_Dataview_Rec, Register_Dataview_Present)
+		Request_Dataview_Rec, Request_Dataview_Present)
 
 	next event End_Call
 	return
-end event Register_Result
+end event Request_Result
 
 event End_Call
+	print("LDAP end call")
 	end_call
 end event End_Call
 
 end fsm LDAP
 
 ###########################################################################
-# FSM REGISTER
+# FSM TEST
 ###########################################################################
-fsm REGISTER
+fsm TEST
 access
-	Register_Dataview			routing_string
+	Test_Access_Key				routing_string
 end access
 
 call_dynamic
-	BCI_instance				counter
-	BCI_request_id				counter
+	BCI_call_info				Call_Info
 end call_dynamic
 
 dynamic
 	#--------------------------------------------------------------------------
-	# FSM REGISTER Event Definitions
+	# FSM TEST Event Definitions
 	#--------------------------------------------------------------------------
-	Command_Parsing				def_event {
-		text			string,
-	}
-
-	Register				def_event {
-		phone			string,
-		name			string,
-		passwd			string,
-	}
-
-	Register_Result				def_event {
+	Test_Result				def_event {
 		result			Result_Code,
 		message			string
 	}
@@ -499,474 +475,71 @@ dynamic
 end dynamic
 
 initialize
-	if Register_Dataview != ""
-	then
-		set Glb_Register_Dataview_Info.name = Register_Dataview
-		set Glb_Return_Val = register!attach_owner( Register_Dataview )
-
-		if Glb_Return_Val == e_a_okay
-		then
-			set Glb_Register_Dataview_Info.instance =
-				register!get_instance ( Register_Dataview )
-		else	# attach_owner failed
-			set Glb_Register_Dataview_Info.instance = 0
-		end if
-
-		if Glb_Return_Val == 0
-		then
-			print(Register_Dataview : ": dataview attach failed!\n")
-		end if
-	end if
+	set Glb_Test_INIT_TIMESTAMP = clock()
+	schedule( clock = clock() + 3,
+		to = customer_index(),
+		event = Test_Init )
 end initialize
 
-#-------------------------------------------------------------------------------
-# Dataview Request Handlers
-#
-# Description	: Dataview handler that accepts Input Messages (IM's), handles
-#		  the request, and reports status with a corresponding Output
-#		  Message (OM).
-#-------------------------------------------------------------------------------
-event register!read_received
-	if Glb_Register_Dataview_Info.instance == 0
+event Test_Init
+	set Glb_Test_Access = routing_string!lookup( Test_Access_Key )
+	if Glb_Test_Access == 0
 	then
-		print(Register_Dataview : ": dataview not running!\n")
-		set Glb_Return_Val = register!send_read_failed(
-			@.instance, @.request_id, e_application_error)
-		next event End_Call
-		return
+		schedule( clock = clock() + 3, event = Test_Init )
+	else
+		set Glb_Test_Init_Time = clock() - Glb_Test_INIT_TIMESTAMP
 	end if
+	end_call
+end event Test_Init
 
-	set BCI_instance = @.instance
-	set BCI_request_id = @.request_id
+event Test
+	print("Test Recieved!")
+	print("Command: ", @.command)
+	print("Text   : ", @.text)
+	set BCI_call_info = @.call_info
 
-	set Command_Parsing.text = @.text
-	next event Command_Parsing
+	set Test_Result.result = SUCCESS
+	set Test_Result.message = "test succeeded!"
+	next event Test_Result
 	return
-end event register!read_received
+end event Test
 
-event Command_Parsing
-dynamic
-	Parse_Result				Parse_Result_rec
-	Head					string
-	Remainder				string
-	Option					string
-	Value					string
-end dynamic
-	set Remainder = map( @.text, a_z:" ", A_Z )
-	set Parse_Result = Parse( ":", @.text)
-	set Head = Parse_Result.head
-	set Remainder = Parse_Result.tail
-	test Head
-	case "REGISTER"
-		# Get Options
-		while Remainder != ""
-		do
-			set Parse_Result = Parse( ",", Remainder )
-			set Head = Parse_Result.head
-			set Remainder = Parse_Result.tail
-			set Parse_Result = Parse( "=", Head )
-			set Option = Parse_Result.head
-			set Value = Parse_Result.tail
-			test Option
-			case "PHONE"
-				set Register.phone = Value
-			case "NAME"
-				set Register.name = Value
-			case "PASSWD"
-				set Register.passwd = Value
-			other	# Option not recognized
-				set Register_Result.result = FAIL
-				set Register_Result.message = Option :
-					": option not recognized"
-				next event Register_Result
-				return
-			end test
-		end while
-		next event Register
-		return
-	other
-		set Register_Result.result = FAIL
-		set Register_Result.message = Head : ": command not recognized"
-		next event Register_Result
-		return
-	end test
-			
-end event Command_Parsing
-
-event Register
-dynamic
-	Account					User_Account_RTDB_fields
-end dynamic
-
-	if length(@.phone) != 13 || map(@.phone, "0123456789", "") != ""
-	then
-		set Register_Result.result = FAIL
-		set Register_Result.message = "phone number format error"
-		next event Register_Result
-		return
-	end if
-
-	if length(@.passwd) > MAX_PASSWD_LEN || map(@.passwd, PASSWD_CHARS, "") != ""
-	then
-		set Register_Result.result = FAIL
-		set Register_Result.message = "password cannot contain characters other than letters, digits, space and !@#$%^&*()"
-		next event Register_Result
-		return
-	end if
-
-	set Account.User_ID = @.phone
-	set Account.Passwd = Encrypt( @.passwd )
-	set Account.Name = @.name
-	set Account.Phone = @.phone
-	set Account.Registration_TS = clock()
-
-	User_Account_RTDB!insert( instance = Glb_User_Account_RTDB,
-		data = Account)
-	
-end event Register
-
-event User_Account_RTDB!insert_completed
-	set Register_Result.result = SUCCESS
-	set Register_Result.message = "register successful"
-	next event Register_Result
-	return
-end event User_Account_RTDB!insert_completed
-
-event User_Account_RTDB!insert_failed
-	set Register_Result.result = FAIL
-	set Register_Result.message = string( @.failure_reason )
-	next event Register_Result
-	return
-end event User_Account_RTDB!insert_failed
-
-event Register_Result
-dynamic
-	Register_Dataview_Rec			register_fields
-	Register_Dataview_Present		register_present
-end dynamic
-	set Register_Dataview_Rec.result_code = @.result
-	set Register_Dataview_Rec.message = @.message
-	set Register_Dataview_Present.result_code
-	set Register_Dataview_Present.message
-	set Glb_Return_Val = register!send_read_completed (
-		BCI_instance, BCI_request_id,
-		Register_Dataview_Rec, Register_Dataview_Present)
-
+event Test_Result
+	set Request_Result.result = @.result
+	set Request_Result.message = @.message
+	send( to = BCI_call_info.call_id,
+		event = Request_Result,
+		ack = false )
 	next event End_Call
 	return
-end event Register_Result
+end event Test_Result
 
 event End_Call
+	print("TEST end call")
 	end_call
 end event End_Call
-
-end fsm REGISTER
+end fsm TEST
 
 ###########################################################################
-# FSM LOGIN
+# FSM IMOM
 ###########################################################################
-fsm LOGIN
+fsm IMOM
 access
-	Login_Dataview			routing_string
+	IMOM_Access_Key				routing_string
 end access
 
 call_dynamic
-	BCI_instance				counter
-	BCI_request_id				counter
-	BCI_phone				string
-	BCI_passwd				string
-	BCI_Timestamp				counter
+	BCI_transaction_id			counter
 end call_dynamic
 
-dynamic
-	#--------------------------------------------------------------------------
-	# FSM REGISTER Event Definitions
-	#--------------------------------------------------------------------------
-	Command_Parsing				def_event {
-		text			string,
-	}
-
-	Account_Retrive					def_event {
-		phone			string,
-	}
-
-	Account_Verification					def_event {
-		passwd			string,
-	}
-
-	Update_Session						def_event {
-	}
-
-	Login_Result				def_event {
-		result			Result_Code,
-		message			string
-	}
-
-	End_Call				def_event {}
-
-end dynamic
-
-initialize
-	if Login_Dataview != ""
-	then
-		set Glb_Login_Dataview_Info.name = Login_Dataview
-		set Glb_Return_Val = register!attach_owner( Login_Dataview )
-
-		if Glb_Return_Val == e_a_okay
-		then
-			set Glb_Login_Dataview_Info.instance =
-				register!get_instance ( Login_Dataview )
-		else	# attach_owner failed
-			set Glb_Login_Dataview_Info.instance = 0
-		end if
-
-		if Glb_Return_Val == 0
-		then
-			print(Login_Dataview : ": dataview attach failed!\n")
-		end if
-	end if
-end initialize
-
-#-------------------------------------------------------------------------------
-# Dataview Request Handlers
-#
-# Description	: Dataview handler that accepts Input Messages (IM's), handles
-#		  the request, and reports status with a corresponding Output
-#		  Message (OM).
-#-------------------------------------------------------------------------------
-event login!read_received
-	if Glb_Login_Dataview_Info.instance == 0
-	then
-		print(Login_Dataview : ": dataview not running!\n")
-		set Glb_Return_Val = login!send_read_failed(
-			@.instance, @.request_id, e_application_error)
-		next event End_Call
-		return
-	end if
-
-	set BCI_instance = @.instance
-	set BCI_request_id = @.request_id
-
-	set Command_Parsing.text = @.text
-	next event Command_Parsing
-	return
-end event login!read_received
-
-event Command_Parsing
-dynamic
-	Parse_Result				Parse_Result_rec
-	Head					string
-	Remainder				string
-	Option					string
-	Value					string
-end dynamic
-	set Remainder = map( @.text, a_z:" ", A_Z )
-	set Parse_Result = Parse( ":", @.text)
-	set Head = Parse_Result.head
-	set Remainder = Parse_Result.tail
-	test Head
-	case "LOGIN"
-		# Get Options
-		while Remainder != ""
-		do
-			set Parse_Result = Parse( ",", Remainder )
-			set Head = Parse_Result.head
-			set Remainder = Parse_Result.tail
-			set Parse_Result = Parse( "=", Head )
-			set Option = Parse_Result.head
-			set Value = Parse_Result.tail
-			test Option
-			case "PHONE"
-				set Account_Retrive.phone = Value
-				set BCI_phone = Value
-			case "PASSWD"
-				set BCI_passwd = Encrypt( Value )
-			other	# Option not recognized
-				set Login_Result.result = FAIL
-				set Login_Result.message = Option :
-					": option not recognized"
-				next event Login_Result
-				return
-			end test
-		end while
-		next event Account_Retrive
-		return
-	other
-		set Login_Result.result = FAIL
-		set Login_Result.message = Head : ": command not recognized"
-		next event Login_Result
-		return
-	end test
-			
-end event Command_Parsing
-
-event Account_Retrive
-
-	if length(@.phone) != 13 || map(@.phone, "0123456789", "") == ""
-	then
-		set Login_Result.result = FAIL
-		set Login_Result.message = "phone number format error"
-		next event Login_Result
-		return
-	end if
-
-	User_Account_RTDB!read( instance = Glb_User_Account_RTDB,
-		User_ID = @.phone)
-	
-end event Account_Retrive
-
-event Account_Verification
-dynamic
-	Session_Rec			Session_RTDB_fields
-end dynamic
-	if BCI_passwd != @.passwd
-	then
-		set Login_Result.result = FAIL
-		set Login_Result.message = "login failed - wrong password"
-		next event Login_Result
-		return
-	end if
-
-	set BCI_Timestamp = clock()
-
-	# Create Session
-	set Session_Rec.Session_ID = Gen_Session_ID( BCI_phone )
-	set Session_Rec.User_ID = BCI_phone
-	set Session_Rec.Client_ID = Glb_Client_ID
-	set Session_Rec.Start_TS = BCI_Timestamp
-	set Session_Rec.Last_Active_TS = BCI_Timestamp
-
-	Session_RTDB!insert( instance = Glb_Session_RTDB,
-		data = Session_Rec )
-
-end event Account_Verification
-
-event User_Account_RTDB!read_completed
-	set Account_Verification.passwd = @.data.Passwd
-	next event Account_Verification
-	return
-end event User_Account_RTDB!read_completed
-
-event User_Account_RTDB!read_failed
-	if @.failure_reason != e_tuple_not_found
-	then 
-		send_om( msg_class = GSL_Assert_Message_Class,
-			title = Glb_RTDB_Operation_Assert_Title,
-			poa = GSL_Assert_Priority,
-			message = "User_Account_RTDB operation error"
-				: string( @.failure_reason ))
-		set Login_Result.result = FAIL
-		set Login_Result.message = "login failed - system error"
-		next event Login_Result
-		return
-	end if
-
-	# user_id not found
-	set Login_Result.result = FAIL
-	set Login_Result.message = "login failed - invalid account"
-	next event Login_Result
-	return
-end event User_Account_RTDB!read_failed
-
-event Session_RTDB!insert_completed
-	set Login_Result.result = SUCCESS
-	set Login_Result.message = "login successful"
-	next event Login_Result
-	return
-end event Session_RTDB!insert_completed
-
-event Session_RTDB!insert_failed
-	if @.failure_reason != e_duplicate_key
-	then 
-		send_om( msg_class = GSL_Assert_Message_Class,
-			title = Glb_RTDB_Operation_Assert_Title,
-			poa = GSL_Assert_Priority,
-			message = "Session_RTDB operation error"
-				: string( @.failure_reason ))
-		set Login_Result.result = FAIL
-		set Login_Result.message = "login failed - system error"
-		next event Login_Result
-		return
-	end if
-
-	# duplicate session_id
-	next event Update_Session
-	return
-end event Session_RTDB!insert_failed
-
-event Update_Session
-dynamic
-	Session_Rec				Session_RTDB_fields
-	Session_Rec_Present			Session_RTDB_present
-end dynamic
-	set Session_Rec.Session_ID = BCI_phone
-	set Session_Rec.Client_ID = Glb_Client_ID
-	set Session_Rec.Start_TS = BCI_Timestamp
-	set Session_Rec.Last_Active_TS = BCI_Timestamp
-	set Session_Rec_Present.Session_ID
-	set Session_Rec_Present.Client_ID
-	set Session_Rec_Present.Start_TS
-	set Session_Rec_Present.Last_Active_TS
-
-	Session_RTDB!update( instance = Glb_Session_RTDB,
-		data = Session_Rec, present = Session_Rec_Present )
-
-end event Update_Session
-
-event Session_RTDB!update_completed
-	set Login_Result.result = SUCCESS
-	set Login_Result.message = "login successful"
-	next event Login_Result
-	return
-end event Session_RTDB!update_completed
-
-event Session_RTDB!update_failed
-	send_om( msg_class = GSL_Assert_Message_Class,
-		title = Glb_RTDB_Operation_Assert_Title,
-		poa = GSL_Assert_Priority,
-		message = "Session_RTDB operation error"
-			: string( @.failure_reason ))
-	set Login_Result.result = FAIL
-	set Login_Result.message = "login failed - system error"
-	next event Login_Result
-	return
-end event Session_RTDB!update_failed
-
-event Login_Result
-dynamic
-	Login_Dataview_Rec			login_fields
-	Login_Dataview_Present			login_present
-end dynamic
-	set Login_Dataview_Rec.result_code = @.result
-	set Login_Dataview_Rec.message = @.message
-	set Login_Dataview_Present.result_code
-	set Login_Dataview_Present.message
-	set Glb_Return_Val = login!send_read_completed (
-		BCI_instance, BCI_request_id,
-		Login_Dataview_Rec, Login_Dataview_Present)
-
-	next event End_Call
-	return
-end event Login_Result
-
-event End_Call
-	end_call
-end event End_Call
-
-end fsm LOGIN
-
-
-###########################################################################
-# FSM RECHARGE
-###########################################################################
-fsm RECHARGE
-access
-	RECHARGE_Access_Key			routing_string
-end access
 dynamic
 	#--------------------------------------------------------------------------
 	# FSM RECHARGE Event Definitions
 	#--------------------------------------------------------------------------
+	Command_Parsing				def_event {
+		text			string,
+	}
+
 	End_Call				def_event {}
 end dynamic
 #-------------------------------------------------------------------------------
@@ -977,19 +550,86 @@ end dynamic
 #		  Message (OM).
 #-------------------------------------------------------------------------------
 event usli_request
-
-	if @.text == "test"
-	then
-		send_usli_response(transaction_id = @.transaction_id, code = "OK",text = "Input message accepted! Content=":@.text)
-	else
-		send_usli_response(transaction_id = @.transaction_id, code = "NG",text = "Input message not recognized! Content=":@.text)
-	end if
-
-	print("test line executed\n")
-
+	set Command_Parsing.text = @.text
+	next event Command_Parsing
 	return
-
 end event usli_request
+
+event Command_Parsing
+dynamic
+	Parse_Result				Parse_Result_rec
+	Head					string
+	Remainder				string
+	Option					string
+	Value					string
+end dynamic
+	set Remainder = map( @.text, a_z:" ", A_Z )
+	set Parse_Result = Parse( ":", @.text)
+	set Head = Parse_Result.head
+	set Remainder = Parse_Result.tail
+	test Head
+	case "TEST"
+		set Test.command = Head
+		# Get Options
+		while Remainder != ""
+		do
+			set Parse_Result = Parse( ",", Remainder )
+			set Head = Parse_Result.head
+			set Remainder = Parse_Result.tail
+			set Parse_Result = Parse( "=", Head )
+			set Option = Parse_Result.head
+			set Value = Parse_Result.tail
+			test Option
+			case "TEXT"
+				set Test.text = Value
+			other	# Option not recognized
+				set Request_Result.result = FAIL
+				set Request_Result.message = Option :
+					": option not recognized"
+				next event Request_Result
+				return
+			end test
+		end while
+		set Test.call_info.call_id = call_index()
+		set Test.call_info.from_other_client = false
+		send( to = Glb_Test_Access,
+			event = Test,
+			ack = true )
+		return
+	other
+		set Request_Result.result = FAIL
+		set Request_Result.message = Head : ": command not recognized"
+		next event Request_Result
+		return
+	end test
+			
+end event Command_Parsing
+
+event send_completed
+end event send_completed
+
+event send_failed
+	set Request_Result.result = FAIL
+	set Request_Result.message = "send request failed: " : string(@.failure_reason)
+	next event Request_Result
+	return
+end event send_failed
+
+event Request_Result
+dynamic
+	Request_Dataview_Rec			request_fields
+	Request_Dataview_Present		request_present
+end dynamic
+
+	if @.result == SUCCESS
+	then
+		send_usli_response(transaction_id = BCI_transaction_id, code = "OK",text = "Request succeeded! Content=":@.message)
+	else
+		send_usli_response(transaction_id = BCI_transaction_id, code = "NG",text = "Request failed! Content=":@.message)
+	end if
+	next event End_Call
+	return
+end event Request_Result
 
 # send usli_response success event
 event usli_response_succeeded
@@ -1006,77 +646,10 @@ event usli_response_failed
 end event usli_response_failed
 
 event End_Call
-	end_call
-end event
-
-end fsm RECHARGE
-
-###########################################################################
-# FSM SERVICE
-###########################################################################
-fsm SERVICE
-access
-	SERVICE_Access_Key			routing_string
-end access
-
-dynamic
-	RTDB_Init				def_event {
-	}
-
-	Request_Handler				def_event {
-	}
-
-	End_Call				def_event {}
-end dynamic
-
-initialize
-	#set Glb_Client_ID = CC_Enum_To_Client_Host( which_client_cc_am_i() )
-	#schedule(event = RTDB_Init, clock = clock() + 3)
-end initialize
-
-event RTDB_Init
-	set Glb_Return_Val = User_Account_RTDB!attach ( "User_Account_RTDB" )
-	if Glb_Return_Val == e_out_of_memory
-	then
-		set Glb_Return_Val = User_Account_RTDB!attach_no_cache("User_Account_RTDB" )
-		if Glb_Return_Val != e_a_okay
-		then
-			#handle attach_no_cache error and
-			print ("User_Account_RTDB attach_no_cache failure")
-		end if
-	elif Glb_Return_Val != e_a_okay
-	then
-		#handle non memory error and
-		print ("User_Account_RTDB attach non memory error")
-	end if
-	set Glb_User_Account_RTDB = User_Account_RTDB!get_instance( "User_Account_RTDB" )
-
-	set Glb_Return_Val = Session_RTDB!attach ( "Session_RTDB" )
-	if Glb_Return_Val == e_out_of_memory
-	then
-		set Glb_Return_Val = Session_RTDB!attach_no_cache("Session_RTDB" )
-		if Glb_Return_Val != e_a_okay
-		then
-			#handle attach_no_cache error and
-			print ("Session_RTDB attach_no_cache failure")
-		end if
-	elif Glb_Return_Val != e_a_okay
-	then
-		#handle non memory error and
-		print ("Session_RTDB attach non memory error")
-	end if
-	set Glb_Session_RTDB = Session_RTDB!get_instance( "Session_RTDB" )
-
-	next event End_Call
-end event RTDB_Init
-	
-event Request_Handler
-end event Request_Handler
-
-event End_Call
+	print("IMOM end call")
 	end_call
 end event End_Call
 
-end fsm SERVICE
+end fsm IMOM
 
 end client
