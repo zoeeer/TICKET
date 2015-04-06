@@ -77,7 +77,10 @@ type
 		RFC_ORDER_LIMIT	= 5,
 		RFC_UNPAIED_ORDER = 6,
 	}
-
+	Get_Client_Failure_Code enum {
+		GCFC_INVALIED_ACTION = 0,
+		GCFC_SYSTEM_BUSY = 1,
+	}
 end type
 
 # Global rc
@@ -97,7 +100,7 @@ rc
 	#max tickets that in one order
 	max_tickets_of_order	counter
 	transaction_limits		counter
-	user_lock_limits		counter
+	rec_lock_limits		counter
 end rc
 
 rtdb
@@ -119,6 +122,7 @@ rtdb
 	{
 		User_ID	string(32)	{key,name="USER_NAME"},
 		Client_ID	string(32)	{name="CLIENT_ID"},
+		Expire_Clock				counter,
 	}
 
 	User_Account_RTDB		table	record {
@@ -154,7 +158,7 @@ rtdb
 	}
 
 	Session_RTDB			table	record {
-		Session_ID		string(20)	{key},
+		Session_ID		long_counter	{key},
 		User_ID			string(32),
 		Client_ID		counter,
 		Start_TS		counter,
@@ -177,6 +181,36 @@ dataview
 		message			string(30),
 	}
 
+	logout			table	{owner}	record {
+		text			string(32)	{key},
+		result_code		Result_Code,
+		message			string(30),
+	}
+	reserve			table	{owner}	record {
+		text			string(128)	{key},
+		result_code		Result_Code,
+		message			string(128),
+	}
+	recharge			table	{owner}	record {
+		text			string(128)	{key},
+		result_code		Result_Code,
+		message			string(128),
+	}
+	pay			table	{owner}	record {
+		text			string(32)	{key},
+		result_code		Result_Code,
+		message			string(30),
+	}
+	query			table	{owner}	record {
+		text			string(32)	{key},
+		result_code		Result_Code,
+		message			string(30),
+	}
+	refund			table	{owner}	record {
+		text			string(32)	{key},
+		result_code		Result_Code,
+		message			string(30),
+	}
 end dataview
 
 ########################################################################
@@ -209,10 +243,11 @@ type
 		Trans_Type	Trans_Type,
 	}
 
-	Per_User_Lock record {
-		user_lock		flag,
+	Record_Lock record {
+		rec_lock		flag,
 	}
 	
+	Ticket_Reserve_File_Type		measurement file(50000)	
 
 end type
 dynamic
@@ -235,8 +270,16 @@ dynamic
 	Glb_Trans_Rollback_tbl 		table Reserve_Request
 	Glb_Trans_Tbl_Limits		counter
 	#for concurrency of sessions of the same user
-	Glb_User_Lock_tbl			hash table(string) Per_User_Lock
+	Glb_User_Lock_tbl			hash table(string) Record_Lock
 	Glb_User_Lock_Tbl_Limits	counter
+	#for ticket reserve
+	Glb_Ticket_Lock_tbl			hash table(string) Record_Lock
+	Glb_Ticket_Lock_Tbl_Limits	counter
+	
+	#for User-Client map
+	User_Client_Map_Expire_Time	counter
+	User_Client_Map_Thresh_Time	counter
+	Glb_Reserve_File			Ticket_Reserve_File_Type
 	
 	a_z					string(26)
 	A_Z					string(26)
@@ -281,11 +324,31 @@ dynamic
 	}
 	Add_New_Order def_event {
 	}
+	Reserve_Ticket def_event {
+		session_id		counter,
+		user_id				string,
+		ticket_id			string,
+		ticket_num		counter,
+	}
+	
 	Reserve_Ticket_failed def_event {
 		fail_reason	Reserve_Failure_Code,
 	}	
 	Reserve_Ticket_success def_event {
 		order_id long_counter,
+	}
+	Get_User_Client def_event {
+		user_id	string,
+	}
+	Get_User_Client_success def_event {
+		client_id	string,
+	}
+	Get_User_Client_failed def_event {
+		fail_reason	Get_Client_Failure_Code,
+	}
+	Refund_Order def_event {
+		ticket_id	string,
+		ticket_num	counter,
 	}
 	
 end dynamic
@@ -330,7 +393,7 @@ end def_function Del_Rollback_Transaction
 def_function Try_Lock_User(
 	user_id	string) flag
 dynamic
-	Local_User_Lock	Per_User_Lock
+	Local_User_Lock	Record_Lock
 end dynamic
 	if  table_length(Glb_User_Lock_tbl) >= Glb_User_Lock_Tbl_Limits
 	then 
@@ -338,28 +401,66 @@ end dynamic
 	end if
 	if element_exists(Glb_User_Lock_tbl, user_id) == true
 	then
-		if Glb_User_Lock_tbl[user_id].user_lock == true
+		if Glb_User_Lock_tbl[user_id].rec_lock == true
 		then
 			return (false)
 		else
-			set Glb_User_Lock_tbl[user_id].user_lock = true
+			set Glb_User_Lock_tbl[user_id].rec_lock = true
 			return (true)
 		end if
 	else
-		set Local_User_Lock.user_lock = true
+		set Local_User_Lock.rec_lock = true
 		insert Local_User_Lock into Glb_User_Lock_tbl at user_id
 		return (true)
 	end if
+	return (false)
 end def_function Try_Lock_User
 
 def_function UnLock_User(
 	user_id	string) flag
 	if element_exists(Glb_User_Lock_tbl, user_id) == true
 	then
-		set Glb_User_Lock_tbl[user_id].user_lock = false
+		set Glb_User_Lock_tbl[user_id].rec_lock = false
 	end if
 	return (true)
 end def_function UnLock_User
+
+def_function Try_Lock_Ticket(
+	Ticket_id	string) flag
+dynamic
+	Local_Ticket_Lock	Record_Lock
+end dynamic
+	if  table_length(Glb_Ticket_Lock_tbl) >= Glb_Ticket_Lock_Tbl_Limits
+	then 
+		return(false)
+	end if
+	if element_exists(Glb_Ticket_Lock_tbl, Ticket_id) == true
+	then
+		if Glb_Ticket_Lock_tbl[Ticket_id].rec_lock == true
+		then
+			return (false)
+		else
+			set Glb_Ticket_Lock_tbl[Ticket_id].rec_lock = true
+			return (true)
+		end if
+	else
+		set Local_Ticket_Lock.rec_lock = true
+		insert Local_Ticket_Lock into Glb_Ticket_Lock_tbl at Ticket_id
+		return (true)
+	end if
+	return (false)
+end def_function Try_Lock_Ticket
+
+def_function UnLock_Ticket(
+	Ticket_id	string) flag
+	if element_exists(Glb_Ticket_Lock_tbl, Ticket_id) == true
+	then
+		set Glb_Ticket_Lock_tbl[Ticket_id].rec_lock = false
+	end if
+	return (true)
+end def_function UnLock_Ticket
+
+
 
 initialize
 	set a_z = "abcdefghijklmnopqrstuvwxyz"
@@ -382,9 +483,11 @@ initialize
          #set transaction limit
 	set  Glb_Trans_Tbl_Limits = transaction_limits
 	 #set user lock limits
-	 set Glb_User_Lock_Tbl_Limits = user_lock_limits
+	 set Glb_User_Lock_Tbl_Limits = rec_lock_limits
          #set order id base value
          set Glb_Current_Order_Id =clock() * (hex_to_counter(hex_value("0x10000000")))*2
+	set User_Client_Map_Expire_Time = 60
+	set User_Client_Map_Thresh_Time = 5
 	set Glb_Server_Current_Clock = clock()	
 	schedule(clock = Glb_Server_Current_Clock + 2, event = Adjust_Server_Systime, to=0)
 	schedule(clock = Glb_Server_Current_Clock + 2, event = RTDB_Init, to=0)
@@ -393,7 +496,9 @@ initialize
 	schedule(clock = clock() + 3, event = Transanction_Manage, to = 0)
 
 end initialize
-
+###########################################################################
+# FSM Srv_System_Clock
+###########################################################################
 fsm Srv_System_Clock
 event Adjust_Server_Systime
 	set Glb_Server_Current_Clock = clock()
@@ -402,6 +507,9 @@ end event
 
 end fsm
 
+###########################################################################
+# FSM Srv_Audit_FSM
+###########################################################################
 fsm Srv_Audit_FSM
 type
 
@@ -426,7 +534,7 @@ call_dynamic
 		session_fields		Session_RTDB_fields
 	}
 	Audit_Delete_Session def_event {
-		session_id		string
+		session_id		long_counter
 	}
 	
 	Local_Next_Order_Audit_Timing		counter
@@ -796,6 +904,9 @@ end event End_Call
 end fsm
 
 
+###########################################################################
+# FSM Srv_Ticketing_FSM
+###########################################################################
 fsm Srv_Ticketing_FSM
 type
 	
@@ -810,12 +921,6 @@ call_dynamic
 	End_Call				def_event {}
 	Check_User_Info def_event {
 	}
-	Reserve_Ticket def_event {
-		session_id		counter,
-		user_id				string,
-		ticket_id			string,
-		ticket_num		counter,
-	}
 end call_dynamic
 
 access
@@ -826,9 +931,8 @@ event Check_Ticket_Info
 dynamic
 	Local_Ret		flag
 end dynamic
-	if Glb_Ticket_Info_RTDB_Lock == false
+	if Try_Lock_Ticket(BCI_Reserve_Request.ticket_id) == true
 	then
-		set Glb_Ticket_Info_RTDB_Lock = true
 		Ticket_Info_RTDB!read(instance = Glb_Ticket_Info_RTDB, Ticket_Id = BCI_Reserve_Request.ticket_id)
 	else
 		#add the task to the queue
@@ -866,8 +970,10 @@ end dynamic
 	set Local_Ticket_Info = @.data
 	if Local_Ticket_Info.Available_Seats < BCI_Reserve_Request.ticket_num
 	then
-		set Glb_Ticket_Info_RTDB_Lock = false
-		set Action_Result.result = FAIL
+		if UnLock_Ticket(BCI_Reserve_Request.ticket_id) == true
+		then
+		end if
+	set Action_Result.result = FAIL
 		set Action_Result.message = "ticketing reserve failed"
 		set Reserve_Ticket_failed.fail_reason = RFC_UNPAIED_ORDER
 		xp_send(to = BCI_Reserve_Request.call_id , event = Reserve_Ticket_failed, ack = false)
@@ -877,7 +983,9 @@ end dynamic
 	#check train time
 	if Local_Ticket_Info.Start_Time_ST < clock()
 	then
-		set Glb_Ticket_Info_RTDB_Lock = false
+		if UnLock_Ticket(BCI_Reserve_Request.ticket_id) == true
+		then
+		end if
 		set Action_Result.result = FAIL
 		set Action_Result.message = "ticketing reserve failed"
 		set Reserve_Ticket_failed.fail_reason = RFC_SESSION_TIME_OUT
@@ -896,7 +1004,13 @@ event  Ticket_Info_RTDB!read_failed
 dynamic
 	Local_Ret		flag
 end dynamic
-	set Glb_Ticket_Info_RTDB_Lock = false
+	send_om( msg_class = GSL_Assert_Message_Class, title = Glb_RTDB_Operation_Assert_Title,
+		poa = GSL_Assert_Priority, message = "Ticket_Info_RTDB!read_failed failed" : string( @.failure_reason ))
+
+	if UnLock_Ticket(BCI_Reserve_Request.ticket_id) == true
+	then
+	end if
+
 	#add the task to the queue
 	set BCI_Reserve_Request.fail_type = TST_TICKET_RTDB_FAIL
 	if BCI_Reserve_Request.Trans_Type == TT_NONE
@@ -924,7 +1038,10 @@ end event
 
 event Ticket_Info_RTDB!update_completed
 	#unlock the rtdb
-	set Glb_Ticket_Info_RTDB_Lock = false
+
+	if UnLock_Ticket(BCI_Reserve_Request.ticket_id) == true
+	then
+	end if
 	next event Add_New_Order
 	return
 end event
@@ -933,7 +1050,12 @@ event Ticket_Info_RTDB!update_failed
 dynamic
 	Local_Ret		flag
 end dynamic
-	set Glb_Ticket_Info_RTDB_Lock = false
+	send_om( msg_class = GSL_Assert_Message_Class, title = Glb_RTDB_Operation_Assert_Title,
+		poa = GSL_Assert_Priority, message = "Ticket_Info_RTDB!update_failed failed" : string( @.failure_reason ))
+
+	if UnLock_Ticket(BCI_Reserve_Request.ticket_id) == true
+	then
+	end if
 	#add the task to the queue
 	set BCI_Reserve_Request.fail_type = TST_TICKET_RTDB_FAIL
 	set BCI_Reserve_Request.fail_type = TST_TICKET_RTDB_FAIL
@@ -986,6 +1108,8 @@ event Order_RTDB!insert_failed
 dynamic
 	Local_Ret		flag
 end dynamic
+	send_om( msg_class = GSL_Assert_Message_Class, title = Glb_RTDB_Operation_Assert_Title,
+		poa = GSL_Assert_Priority, message = "Order_RTDB!insert_failed failed" : string( @.failure_reason ))
 	#add the task to the queue
 	set BCI_Reserve_Request.fail_type = TST_ORDER_RTDB_FAIL
 	set BCI_Reserve_Request.fail_type = TST_TICKET_RTDB_FAIL
@@ -1100,6 +1224,8 @@ event User_Account_RTDB!read_failed
 dynamic
 	Local_Ret		flag
 end dynamic
+	send_om( msg_class = GSL_Assert_Message_Class, title = Glb_RTDB_Operation_Assert_Title,
+		poa = GSL_Assert_Priority, message = "User_Account_RTDB!read_failed failed" : string( @.failure_reason ))
  	if UnLock_User(BCI_Reserve_Request.user_id)  == true
  	then
  	end if
@@ -1134,13 +1260,19 @@ event User_Account_RTDB!update_completed
 	set Action_Result.message = "ticketing reserve success"
 	set Reserve_Ticket_success.order_id = BCI_Reserve_Request.order_id
 	xp_send(to = BCI_Reserve_Request.call_id , event = Reserve_Ticket_success, ack = false)
+	#add measurement
+	file!print(Glb_Reserve_File, "\t", BCI_Reserve_Request.user_id,
+			"\t", BCI_Reserve_Request.session_id, "\t", BCI_Reserve_Request.order_id,
+			"\t", BCI_Reserve_Request.ticket_id, "\t", BCI_Reserve_Request.ticket_num)
 	next event Action_Result
 end event
 
 event User_Account_RTDB!update_failed
- dynamic
+dynamic
 	Local_Ret		flag
 end dynamic
+	send_om( msg_class = GSL_Assert_Message_Class, title = Glb_RTDB_Operation_Assert_Title,
+		poa = GSL_Assert_Priority, message = "User_Account_RTDB!update_failed failed" : string( @.failure_reason ))
 	if UnLock_User(BCI_Reserve_Request.user_id)  == true
  	then
  	end if
@@ -1218,7 +1350,9 @@ event End_Call
 end event End_Call
 
 end fsm
-
+###########################################################################
+# FSM Srv_Trans_Manage_FSM
+###########################################################################
 fsm Srv_Trans_Manage_FSM
 
 type
@@ -1229,7 +1363,18 @@ call_dynamic
 	BCI_Current_Trans_Index		counter
 	BCI_Current_ROLLBACK_Index		counter
 	BCI_Remain_Transaction_Once		counter
+	Roll_Back_Order def_event{
+		request_info	Reserve_Request
+	}
 
+	Roll_Back_Ticket def_event{
+	}
+	BCI_Reserve_Request		Reserve_Request
+	Action_Result				def_event {
+		result			Result_Code,
+		message			string
+	}
+	End_Call				def_event {}
 end call_dynamic
 
 event Transanction_Manage
@@ -1249,15 +1394,8 @@ event Deal_Next_Transaction
 	if BCI_Remain_Transaction_Once >0 
 	then
 		decr BCI_Remain_Transaction_Once
-		test Glb_Trans_Continue_tbl[0].fail_type
-		case TST_TICKET_RTDB_FAIL
-			send(to = parent_index(), event = Check_Ticket_Info, ack = true)
-		case TST_ORDER_RTDB_FAIL
-			send(to = parent_index(), event = Add_New_Order, ack = true)
-		case TST_USER_RTDB_FAIL
-			send(to = parent_index(), event = Update_User_Info, ack = true)
-		other
-		end test
+		set Reserve_Continue.request_info = Glb_Trans_Continue_tbl[1]
+		send(to = 0, event = Reserve_Continue, ack = true)
 	else
 		next event Transanction_Manage
 	end if
@@ -1277,20 +1415,224 @@ event Deal_Next_Rollback
 		next event Transanction_Manage
 	end if
 
+	decr BCI_Remain_Transaction_Once
+	set BCI_Reserve_Request = Glb_Trans_Rollback_tbl[1]
+	test BCI_Reserve_Request.fail_type
+	case TST_TICKET_RTDB_FAIL
+		delete from Glb_Trans_Rollback_tbl at 1
+		set Action_Result.result = FAIL
+		set Action_Result.message = "ticketing reserve failed(Ticket_Info_RTDB!update_failed): ":BCI_Reserve_Request.user_id:string(BCI_Reserve_Request.session_id)
+				:BCI_Reserve_Request.ticket_id:string(BCI_Reserve_Request.ticket_num):string(BCI_Reserve_Request.order_id)
+		set Reserve_Ticket_failed.fail_reason = RFC_SYSTEM_BUSY
+		xp_send(to = BCI_Reserve_Request.call_id, event =Reserve_Ticket_failed, ack = false )
+		next event Action_Result
 
-
-
+	case TST_ORDER_RTDB_FAIL
+		delete from Glb_Trans_Rollback_tbl at 1
+		next event Roll_Back_Order
+	case TST_USER_RTDB_FAIL
+		delete from Glb_Trans_Rollback_tbl at 1
+		next event Roll_Back_Ticket
+	other
+	end test
 
 end event
 
+event Roll_Back_Order
+	
+	Order_RTDB!delete(instance = Glb_Order_RTDB, Order_ID = BCI_Reserve_Request.order_id)
+	next event Roll_Back_Ticket
+	
+end event
+
+event Order_RTDB!delete_completed
+
+end event
+
+event Order_RTDB!delete_failed
+	send_om( msg_class = GSL_Assert_Message_Class, title = Glb_RTDB_Operation_Assert_Title,
+		poa = GSL_Assert_Priority, message = "Order_RTDB!delete_failed failed" : string( @.failure_reason ))
+	set Action_Result.result = FAIL
+	set Action_Result.message = "ticketing reserve failed(Order_RTDB!delete_failed): ":BCI_Reserve_Request.user_id:string(BCI_Reserve_Request.session_id)
+			:BCI_Reserve_Request.ticket_id:string(BCI_Reserve_Request.ticket_num):string(BCI_Reserve_Request.order_id)
+	set Reserve_Ticket_failed.fail_reason = RFC_SYSTEM_BUSY
+	xp_send(to = BCI_Reserve_Request.call_id, event =Reserve_Ticket_failed, ack = false )
+	next event Action_Result
+
+end event
+
+event Roll_Back_Ticket
+	if Try_Lock_Ticket(BCI_Reserve_Request.ticket_id) == true
+	then
+		Ticket_Info_RTDB!read(instance = Glb_Ticket_Info_RTDB, Ticket_Id = BCI_Reserve_Request.ticket_id)
+	else
+		set Action_Result.result = FAIL
+		set Action_Result.message = "ticketing reserve failed( Ticket_Info_RTDB!read locked): ":BCI_Reserve_Request.user_id:string(BCI_Reserve_Request.session_id)
+				:BCI_Reserve_Request.ticket_id:string(BCI_Reserve_Request.ticket_num):string(BCI_Reserve_Request.order_id)
+		set Reserve_Ticket_failed.fail_reason = RFC_SYSTEM_BUSY
+		xp_send(to = BCI_Reserve_Request.call_id, event =Reserve_Ticket_failed, ack = false )
+		next event Action_Result
+	end if	
+end event
 
 
+event Ticket_Info_RTDB!read_completed
+dynamic
+	Local_Ticket_Info		Ticket_Info_RTDB_fields
+	Local_Ticket_present	Ticket_Info_RTDB_present
+end dynamic
+	set Local_Ticket_Info = @.data
+	set Local_Ticket_Info.Available_Seats = Local_Ticket_Info.Available_Seats + BCI_Reserve_Request.ticket_num
+	Ticket_Info_RTDB!update(instance = Glb_Ticket_Info_RTDB, data = Local_Ticket_Info, present = Local_Ticket_present)		
+	return
+end event
+event  Ticket_Info_RTDB!read_failed
+dynamic
+	Local_Ret		flag
+end dynamic
+	send_om( msg_class = GSL_Assert_Message_Class, title = Glb_RTDB_Operation_Assert_Title,
+		poa = GSL_Assert_Priority, message = "Ticket_Info_RTDB!read_failed failed" : string( @.failure_reason ))
+ 	if UnLock_User(BCI_Reserve_Request.user_id)  == true
+ 	then
+ 	end if
+	set Action_Result.result = FAIL
+	set Action_Result.message = "ticketing reserve failed(Ticket_Info_RTDB!read_failed): ":BCI_Reserve_Request.user_id:string(BCI_Reserve_Request.session_id)
+			:BCI_Reserve_Request.ticket_id:string(BCI_Reserve_Request.ticket_num):string(BCI_Reserve_Request.order_id)
+	set Reserve_Ticket_failed.fail_reason = RFC_SYSTEM_BUSY
+	xp_send(to = BCI_Reserve_Request.call_id, event =Reserve_Ticket_failed, ack = false )
+	next event Action_Result
+end event
+
+event Ticket_Info_RTDB!update_completed
+	#unlock the rtdb
+ 	if UnLock_User(BCI_Reserve_Request.user_id)  == true
+ 	then
+ 	end if
+	next event Deal_Next_Rollback
+	return
+end event
+
+event Ticket_Info_RTDB!update_failed
+	send_om( msg_class = GSL_Assert_Message_Class, title = Glb_RTDB_Operation_Assert_Title,
+		poa = GSL_Assert_Priority, message = "Ticket_Info_RTDB!update_failed failed" : string( @.failure_reason ))
+ 	if UnLock_User(BCI_Reserve_Request.user_id)  == true
+ 	then
+ 	end if
+	set Action_Result.result = FAIL
+	set Action_Result.message = "ticketing reserve failed(Ticket_Info_RTDB!update_failed): ":BCI_Reserve_Request.user_id:string(BCI_Reserve_Request.session_id)
+			:BCI_Reserve_Request.ticket_id:string(BCI_Reserve_Request.ticket_num):string(BCI_Reserve_Request.order_id)
+	set Reserve_Ticket_failed.fail_reason = RFC_SYSTEM_BUSY
+	xp_send(to = BCI_Reserve_Request.call_id, event =Reserve_Ticket_failed, ack = false )
+	next event Action_Result
+end event
+
+event Action_Result
+	next event End_Call
+	return
+end event Action_Result
+
+event End_Call
+	end_call
+end event End_Call
 
 end fsm
 
-
+###########################################################################
+# FSM Srv_Routing_FSM
+###########################################################################
 fsm Srv_Routing_FSM
+dynamic
+	BCI_User_Id		string
+	Action_Result				def_event {
+		result			Result_Code,
+		message			string
+	}
+	End_Call				def_event {}
+end dynamic
 
+def_function Assign_Client(
+	user_id string)string
+	return( "client")
+end def_function Assign_Client
+
+event Get_User_Client
+	set BCI_User_Id = @.user_id
+	User_Client_Map_RTDB!read(instance = Glb_User_Client_Map_RTDB, User_ID = @.user_id)
+end event
+
+event User_Client_Map_RTDB!read_completed
+dynamic
+	Local_Map_Info		User_Client_Map_RTDB_fields
+	Local_Map_present	User_Client_Map_RTDB_present
+end dynamic
+
+	set Local_Map_Info = @.data
+	set Local_Map_Info.Expire_Clock = clock() + User_Client_Map_Expire_Time
+	set Get_User_Client_success.client_id = Local_Map_Info.Client_ID
+	xp_send(to = xp_dest_query(), event = Get_User_Client_success, ack = false)
+	User_Client_Map_RTDB!update(instance = Glb_User_Client_Map_RTDB, data = Local_Map_Info, present = Local_Map_present)
+
+end event
+
+event User_Client_Map_RTDB!read_failed
+dynamic
+	Local_Map_Info		User_Client_Map_RTDB_fields
+	Local_Map_present	User_Client_Map_RTDB_present
+end dynamic
+
+	send_om( msg_class = GSL_Assert_Message_Class, title = Glb_RTDB_Operation_Assert_Title,
+		poa = GSL_Assert_Priority, message = "User_Client_Map_RTDB!read_failed failed" : string( @.failure_reason ))
+	set Local_Map_Info.User_ID = BCI_User_Id
+	set Local_Map_Info.Client_ID = Assign_Client(Local_Map_Info.User_ID)
+	set Local_Map_Info.Expire_Clock = clock() + User_Client_Map_Expire_Time
+	User_Client_Map_RTDB!insert(instance = Glb_User_Client_Map_RTDB, data = Local_Map_Info)
+	
+end event
+
+event User_Client_Map_RTDB!update_completed
+	set Action_Result.result = SUCCESS
+	set Action_Result.message = "Get_User_Client success"
+	next event Action_Result
+end event
+
+event User_Client_Map_RTDB!update_failed
+	send_om( msg_class = GSL_Assert_Message_Class, title = Glb_RTDB_Operation_Assert_Title,
+		poa = GSL_Assert_Priority, message = "User_Client_Map_RTDB!update_failed failed" : string( @.failure_reason ))
+	set Get_User_Client_failed.fail_reason = GCFC_SYSTEM_BUSY
+	xp_send(to = xp_dest_query(), event = Get_User_Client_failed, ack = false)
+	set Action_Result.result = FAIL
+	set Action_Result.message = "Get_User_Client failed"
+	next event Action_Result
+
+end event
+
+event User_Client_Map_RTDB!insert_completed
+	set Get_User_Client_success.client_id = BCI_User_Id
+	xp_send(to = xp_dest_query(), event = Get_User_Client_success, ack = false)
+	set Action_Result.result = SUCCESS
+	set Action_Result.message = "Get_User_Client success"
+	next event Action_Result
+
+end event
+
+event User_Client_Map_RTDB!insert_failed
+	send_om( msg_class = GSL_Assert_Message_Class, title = Glb_RTDB_Operation_Assert_Title,
+		poa = GSL_Assert_Priority, message = "User_Client_Map_RTDB!insert_failed failed" : string( @.failure_reason ))
+	set Get_User_Client_failed.fail_reason = GCFC_SYSTEM_BUSY
+	xp_send(to = xp_dest_query(), event = Get_User_Client_failed, ack = false)
+	set Action_Result.result = FAIL
+	set Action_Result.message = "Get_User_Client failed"
+	next event Action_Result
+end event
+
+event Action_Result
+	next event End_Call
+	return
+end event Action_Result
+
+event End_Call
+	end_call
+end event End_Call
 
 end fsm
 
@@ -1335,19 +1677,52 @@ dynamic
 
 	Glb_Register_Dataview_Info		Dataview_Info_rec
 	Glb_Login_Dataview_Info			Dataview_Info_rec
+	Glb_Logout_Dataview_Info		Dataview_Info_rec
+	Glb_Recharge_Dataview_Info		Dataview_Info_rec
+	Glb_Reserve_Dataview_Info		Dataview_Info_rec
+	Glb_Pay_Dataview_Info			Dataview_Info_rec
+	Glb_Query_Dataview_Info		Dataview_Info_rec
+	Glb_Refund_Dataview_Info		Dataview_Info_rec
+	
 	Glb_Return_Val				reason_enum
 
 	Glb_User_Account_RTDB			counter
-	Glb_Session_RTDB			counter
+	Glb_Session_RTDB				counter
+	Glb_Ticket_Info_RTDB			counter
+	Glb_Order_RTDB				counter
+	Glb_User_Client_Map_RTDB		counter
+	Glb_User_Order_RTDB			counter
 
 	Dataview_Init_All			def_event {}
-
+	Reserve_Ticket def_event {
+		session_id		long_counter,
+		user_id				string,
+		ticket_id			string,
+		ticket_num		counter,
+	}
+	
+	Reserve_Ticket_failed def_event {
+		fail_reason	Reserve_Failure_Code,
+	}	
+	Reserve_Ticket_success def_event {
+		order_id long_counter,
+	}
+	Get_User_Client def_event {
+		user_id	string,
+	}
+	Get_User_Client_success def_event {
+		client_id	string,
+	}
+	Get_User_Client_failed def_event {
+		fail_reason	Get_Client_Failure_Code,
+	}
+	
 end dynamic
 
 def_function Parse (
 	Delimiter				string,
 	Input					string
-)	Parse_Result_rec
+)Parse_Result_rec
 dynamic
 	Result					Parse_Result_rec
 	Pos					counter
@@ -1373,10 +1748,10 @@ def_function Encrypt (
 end def_function Encrypt
 
 def_function Gen_Session_ID (
-	Input					string
-)	string
+	user_id	string
+)	long_counter
 
-    return (Input)
+    return (clock())
 end def_function Gen_Session_ID
 
 initialize
@@ -1430,7 +1805,7 @@ dynamic
 		result			Result_Code,
 		message			string
 	}
-
+	
 	End_Call				def_event {}
 
 end dynamic
@@ -1624,6 +1999,7 @@ dynamic
 	}
 
 	Update_Session						def_event {
+		session_id		long_counter,
 	}
 
 	Login_Result				def_event {
@@ -1828,7 +2204,7 @@ dynamic
 	Session_Rec				Session_RTDB_fields
 	Session_Rec_Present			Session_RTDB_present
 end dynamic
-	set Session_Rec.Session_ID = BCI_phone
+	set Session_Rec.Session_ID = Gen_Session_ID(BCI_phone)
 	set Session_Rec.Client_ID = Glb_Client_ID
 	set Session_Rec.Start_TS = BCI_Timestamp
 	set Session_Rec.Last_Active_TS = BCI_Timestamp
@@ -1884,18 +2260,26 @@ end event End_Call
 
 end fsm LOGIN
 
-
 ###########################################################################
 # FSM RECHARGE
 ###########################################################################
 fsm RECHARGE
 access
-	RECHARGE_Access_Key			routing_string
+	Recharge_Dataview			routing_string
 end access
+
+call_dynamic
+	BCI_instance				counter
+	BCI_request_id				counter
+	BCI_user_id				string
+	BCI_session_id				long_counter
+	BCI_fund_num				counter
+	BCI_Timestamp			counter
+end call_dynamic
 
 dynamic
 	#--------------------------------------------------------------------------
-	# FSM RECHARGE Event Definitions
+	# FSM REGISTER Event Definitions
 	#--------------------------------------------------------------------------
 	Command_Parsing				def_event {
 		text			string,
@@ -1909,40 +2293,65 @@ dynamic
 		passwd			string,
 	}
 
-	Recharge					def_event {}
+	Update_Session						def_event {
+		session_id		long_counter,
+	}
 
 	Recharge_Result				def_event {
 		result			Result_Code,
 		message			string
 	}
-
+	DO_Recharge			def_event {
+	}
 	End_Call				def_event {}
+
 end dynamic
 
-call_dynamic
-	BCI_usli_dn				counter
-	BCI_phone				string
-	BCI_passwd				string
-	BCI_balance				string
-	BCI_recharge_amount			string
-	BCI_Timestamp				counter
-	BCI_Amount					counter
-end call_dynamic
+initialize
+	if Recharge_Dataview != ""
+	then
+		set Glb_Recharge_Dataview_Info.name = Recharge_Dataview
+		set Glb_Return_Val = recharge!attach_owner( Recharge_Dataview )
+
+		if Glb_Return_Val == e_a_okay
+		then
+			set Glb_Recharge_Dataview_Info.instance =
+				recharge!get_instance ( Recharge_Dataview )
+		else	# attach_owner failed
+			set Glb_Recharge_Dataview_Info.instance = 0
+		end if
+
+		if Glb_Return_Val == 0
+		then
+			print(Recharge_Dataview : ": dataview attach failed!\n")
+		end if
+	end if
+end initialize
 
 #-------------------------------------------------------------------------------
-# Event		: usli_request
+# Dataview Request Handlers
 #
-# Description	: USLI handler that accepts Input Messages (IM's), handles
+# Description	: Dataview handler that accepts Input Messages (IM's), handles
 #		  the request, and reports status with a corresponding Output
 #		  Message (OM).
 #-------------------------------------------------------------------------------
-event usli_request
+event recharge!read_received
+	if Glb_Recharge_Dataview_Info.instance == 0
+	then
+		print(Recharge_Dataview : ": dataview not running!\n")
+		set Glb_Return_Val = recharge!send_read_failed(
+			@.instance, @.request_id, e_application_error)
+		next event End_Call
+		return
+	end if
+
+	set BCI_instance = @.instance
+	set BCI_request_id = @.request_id
 
 	set Command_Parsing.text = @.text
-	next evnet Command_Parsing
+	next event Command_Parsing
 	return
-
-end event usli_request
+end event recharge!read_received
 
 event Command_Parsing
 dynamic
@@ -1957,7 +2366,7 @@ end dynamic
 	set Head = Parse_Result.head
 	set Remainder = Parse_Result.tail
 	test Head
-	case "RCHG"
+	case "RECHARGE"
 		# Get Options
 		while Remainder != ""
 		do
@@ -1968,13 +2377,13 @@ end dynamic
 			set Option = Parse_Result.head
 			set Value = Parse_Result.tail
 			test Option
-			case "PHONE"
-				set Account_Retrive.phone = Value
-				set BCI_phone = Value
-			case "PASSWD"
-				set BCI_passwd = Encrypt( Value )
-			case "AMMOUNT"
-				set BCI_recharge_amount = Value
+			case "USER"
+				set BCI_user_id = Value
+			case "SESSION"
+				set BCI_session_id =  long_counter( Value )
+			case "FUND"
+				set BCI_fund_num=   counter(Value)
+			
 			other	# Option not recognized
 				set Recharge_Result.result = FAIL
 				set Recharge_Result.message = Option :
@@ -1983,7 +2392,7 @@ end dynamic
 				return
 			end test
 		end while
-		next event Account_Retrive
+		next event DO_Recharge
 		return
 	other
 		set Recharge_Result.result = FAIL
@@ -1994,62 +2403,71 @@ end dynamic
 			
 end event Command_Parsing
 
-event Account_Retrive
-
-	if length(@.phone) != 13 || map(@.phone, "0123456789", "") == ""
+event DO_Recharge
+	if BCI_user_id == "" || BCI_session_id == 0|| BCI_fund_num == 0
 	then
 		set Recharge_Result.result = FAIL
 		set Recharge_Result.message = "phone number format error"
 		next event Recharge_Result
 		return
 	end if
+	set Update_Session.session_id = BCI_session_id
+	next event Update_Session
+end event DO_Recharge
 
-	User_Account_RTDB!read( instance = Glb_User_Account_RTDB,
-		User_ID = @.phone)
-	
-end event Account_Retrive
+event Update_Session
+	Session_RTDB!read( instance = Glb_Session_RTDB, Session_ID = @.session_id)	
+end event
 
-event Account_Verification
-	if BCI_passwd != @.passwd
-	then
-		set Recharge_Result.result = FAIL
-		set Recharge_Result.message = "recharge failed - wrong password"
-		next event Recharge_Result
-		return
-	end if
-
-	next event Recharge
-
-end event Account_Verification
-
-event Recharge
+event Session_RTDB!read_completed
 dynamic
-	Account_Rec				User_Account_RTDB_fields
-	Account_Rec_Present			User_Account_RTDB_present
-	New_Balance			counter
+	Local_Session_Info	Session_RTDB_fields
+	Local_Session_present	Session_RTDB_present	
 end dynamic
-	set New_Balance = BCI_balance + BCI_Amount
-	if New_Balance > MAX_Balance
-	then
+	set Local_Session_Info = @.data
+	set Local_Session_Info.Last_Active_TS = clock()
+	Session_RTDB!update(instance = Glb_Session_RTDB, data = Local_Session_Info)
+end event
+
+event Session_RTDB!read_failed
+	if @.failure_reason != e_tuple_not_found
+	then 
+		send_om( msg_class = GSL_Assert_Message_Class,
+			title = Glb_RTDB_Operation_Assert_Title,
+			poa = GSL_Assert_Priority,
+			message = " Session_RTDB!read_failed"
+				: string( @.failure_reason ))
 		set Recharge_Result.result = FAIL
-		set Recharge_Result.message = "recharge failed - max balance exceeded"
+		set Recharge_Result.message = "recharge failed - system error"
 		next event Recharge_Result
 		return
 	end if
+end event
 
-	set Account_Rec.Balance = New_Balance
-	#set Account_Rec.Balance
-	#set Account_Rec.Last_Active_TS = BCI_Timestamp
-	#set Account_Rec.Last_Active_TS
-	User_Account_RTDB!update( instance = Glb_User_Account_RTDB,
-		data = Account_Rec, present = Account_Rec_Present )
+event Session_RTDB!update_completed
+	User_Account_RTDB!read(instance = Glb_Session_RTDB, User_ID = BCI_user_id)
+end event
 
-end event Recharge
+event Session_RTDB!update_failed
+	send_om( msg_class = GSL_Assert_Message_Class,
+		title = Glb_RTDB_Operation_Assert_Title,
+		poa = GSL_Assert_Priority,
+		message = "Session_RTDB!update_failed  error"
+			: string( @.failure_reason ))
+	set Recharge_Result.result = FAIL
+	set Recharge_Result.message = "recharge failed - system error"
+	next event Recharge_Result
+	return
+end event
 
 event User_Account_RTDB!read_completed
-	set BCI_balance = @.data.Balance
-	set Account_Verification.passwd = @.data.Passwd
-	next event Account_Verification
+dynamic
+	Local_User_Info	User_Account_RTDB_fields
+	Local_User_present	User_Account_RTDB_present
+end dynamic
+	set Local_User_Info = @.data
+	set Local_User_Info.Balance = Local_User_Info.Balance + BCI_fund_num
+	User_Account_RTDB!update(instance = Glb_Session_RTDB, data = Local_User_Info)	
 	return
 end event User_Account_RTDB!read_completed
 
@@ -2076,43 +2494,1189 @@ end event User_Account_RTDB!read_failed
 
 event User_Account_RTDB!update_completed
 	set Recharge_Result.result = SUCCESS
-	set Recharge_Result.message = "recharge succeeded"
+	set Recharge_Result.message = "recharge sucess"
 	next event Recharge_Result
 	return
-end event User_Account_RTDB!update_completed
+end event
 
 event User_Account_RTDB!update_failed
 	send_om( msg_class = GSL_Assert_Message_Class,
 		title = Glb_RTDB_Operation_Assert_Title,
 		poa = GSL_Assert_Priority,
-		message = "User_Account_RTDB operation error"
+		message = "User_Account_RTDB!update_failed operation error"
 			: string( @.failure_reason ))
-	set Rechare_Result.result = FAIL
-	set Rechare_Result.message = "recharge failed - system error"
-	next event Rechare_Result
-	return
-end event User_Account_RTDB!update_failed
+	set Recharge_Result.result = FAIL
+	set Recharge_Result.message = "recharge failed - system error"
+	next event Recharge_Result
+end event
 
-# send usli_response success event
-event usli_response_succeeded
-	print ("\n usli_request success: ", @)
+event Recharge_Result
+dynamic
+	Recharge_Dataview_Rec			recharge_fields
+	Recharge_Dataview_Present			recharge_present
+end dynamic
+	set Recharge_Dataview_Rec.result_code = @.result
+	set Recharge_Dataview_Rec.message = @.message
+	set Recharge_Dataview_Present.result_code
+	set Recharge_Dataview_Present.message
+	set Glb_Return_Val = recharge!send_read_completed(
+		BCI_instance, BCI_request_id,
+		Recharge_Dataview_Rec, Recharge_Dataview_Present )
+
 	next event End_Call
 	return
-end event usli_response_succeeded
-
-# send usli_response fail
-event usli_response_failed
-	print ("\n usli_request failed: ", @)
-	next event End_Call
-	return
-end event usli_response_failed
+end event Recharge_Result
 
 event End_Call
 	end_call
-end event
+end event End_Call
 
 end fsm RECHARGE
 
+
+###########################################################################
+# FSM RESERVE
+###########################################################################
+fsm RESERVE
+access
+	Reserve_Dataview			routing_string
+end access
+
+call_dynamic
+	BCI_instance				counter
+	BCI_request_id				counter
+	BCI_ticket_id				string
+	BCI_user_id				string
+	BCI_session_id				long_counter
+	BCI_ticket_num			counter
+	BCI_Timestamp			counter
+end call_dynamic
+
+dynamic
+	#--------------------------------------------------------------------------
+	# FSM REGISTER Event Definitions
+	#--------------------------------------------------------------------------
+	Command_Parsing				def_event {
+		text			string,
+	}
+
+	Account_Retrive					def_event {
+		phone			string,
+	}
+
+	Account_Verification					def_event {
+		passwd			string,
+	}
+
+	Update_Session						def_event {
+		session_id		long_counter,
+	}
+	DO_Reserve		def_event{
+	}
+	C_S!Reserve_Ticket def_event{
+	}
+	Reserve_Result				def_event {
+		result			Result_Code,
+		message			string
+	}
+	End_Call				def_event {}
+
+end dynamic
+
+initialize
+	if Reserve_Dataview != ""
+	then
+		set Glb_Reserve_Dataview_Info.name = Reserve_Dataview
+		set Glb_Return_Val = reserve!attach_owner( Reserve_Dataview )
+
+		if Glb_Return_Val == e_a_okay
+		then
+			set Glb_Reserve_Dataview_Info.instance =
+				reserve!get_instance ( Reserve_Dataview )
+		else	# attach_owner failed
+			set Glb_Reserve_Dataview_Info.instance = 0
+		end if
+
+		if Glb_Return_Val == 0
+		then
+			print(Reserve_Dataview : ": dataview attach failed!\n")
+		end if
+	end if
+end initialize
+
+#-------------------------------------------------------------------------------
+# Dataview Request Handlers
+#
+# Description	: Dataview handler that accepts Input Messages (IM's), handles
+#		  the request, and reports status with a corresponding Output
+#		  Message (OM).
+#-------------------------------------------------------------------------------
+event reserve!read_received
+	if Glb_Reserve_Dataview_Info.instance == 0
+	then
+		print(Reserve_Dataview : ": dataview not running!\n")
+		set Glb_Return_Val = reserve!send_read_failed(
+			@.instance, @.request_id, e_application_error)
+		next event End_Call
+		return
+	end if
+
+	set BCI_instance = @.instance
+	set BCI_request_id = @.request_id
+
+	set Command_Parsing.text = @.text
+	next event Command_Parsing
+	return
+end event reserve!read_received
+
+event Command_Parsing
+dynamic
+	Parse_Result				Parse_Result_rec
+	Head					string
+	Remainder				string
+	Option					string
+	Value					string
+end dynamic
+	set Remainder = map( @.text, a_z:" ", A_Z )
+	set Parse_Result = Parse( ":", @.text)
+	set Head = Parse_Result.head
+	set Remainder = Parse_Result.tail
+	test Head
+	case "RESERVE"
+		# Get Options
+		while Remainder != ""
+		do
+			set Parse_Result = Parse( ",", Remainder )
+			set Head = Parse_Result.head
+			set Remainder = Parse_Result.tail
+			set Parse_Result = Parse( "=", Head )
+			set Option = Parse_Result.head
+			set Value = Parse_Result.tail
+			test Option
+			case "USER"
+				set BCI_user_id = Value
+			case "SESSION"
+				set BCI_session_id =  long_counter( Value )
+			case "TICKET"
+				set BCI_ticket_id =   Value 			
+			case "TICKET_NUM"
+				set BCI_ticket_num  =  counter( Value )
+			
+			other	# Option not recognized
+				set Reserve_Result.result = FAIL
+				set Reserve_Result.message = Option :
+					": option not recognized"
+				next event Reserve_Result
+				return
+			end test
+		end while
+		next event DO_Reserve
+		return
+	other
+		set Reserve_Result.result = FAIL
+		set Reserve_Result.message = Head : ": command not recognized"
+		next event Reserve_Result
+		return
+	end test
+			
+end event Command_Parsing
+
+event DO_Reserve
+	if BCI_user_id == "" || BCI_session_id == 0 || BCI_ticket_id == "" || BCI_ticket_num == 0
+	then
+		set Reserve_Result.result = FAIL
+		set Reserve_Result.message = "input error"
+		next event Reserve_Result
+		return
+	end if
+	set Update_Session.session_id = BCI_session_id
+	next event Update_Session
+end event DO_Reserve
+
+event Update_Session
+	Session_RTDB!read( instance = Glb_Session_RTDB, Session_ID = @.session_id)	
+end event
+
+event Session_RTDB!read_completed
+dynamic
+	Local_Session_Info	Session_RTDB_fields
+	Local_Session_present	Session_RTDB_present	
+end dynamic
+	set Local_Session_Info = @.data
+	set Local_Session_Info.Last_Active_TS = clock()
+	Session_RTDB!update(instance = Glb_Session_RTDB, data = Local_Session_Info)
+end event
+
+event Session_RTDB!read_failed
+	if @.failure_reason != e_tuple_not_found
+	then 
+		send_om( msg_class = GSL_Assert_Message_Class,
+			title = Glb_RTDB_Operation_Assert_Title,
+			poa = GSL_Assert_Priority,
+			message = " Session_RTDB!read_failed"
+				: string( @.failure_reason ))
+		set Reserve_Result.result = FAIL
+		set Reserve_Result.message = "reserve failed - system error"
+		next event Reserve_Result
+		return
+	end if
+end event
+
+event Session_RTDB!update_completed
+	User_Account_RTDB!read(instance = Glb_Session_RTDB, User_ID = BCI_user_id)
+end event
+
+event Session_RTDB!update_failed
+	send_om( msg_class = GSL_Assert_Message_Class,
+		title = Glb_RTDB_Operation_Assert_Title,
+		poa = GSL_Assert_Priority,
+		message = "Session_RTDB!update_failed  error"
+			: string( @.failure_reason ))
+	set Reserve_Result.result = FAIL
+	set Reserve_Result.message = "reserve failed - system error"
+	next event Reserve_Result
+	return
+end event
+
+event User_Account_RTDB!read_completed
+dynamic
+	Local_User_Info	User_Account_RTDB_fields
+end dynamic
+	set Local_User_Info = @.data
+	next event Account_Verification	
+	return
+end event User_Account_RTDB!read_completed
+
+event User_Account_RTDB!read_failed
+	if @.failure_reason != e_tuple_not_found
+	then 
+		send_om( msg_class = GSL_Assert_Message_Class,
+			title = Glb_RTDB_Operation_Assert_Title,
+			poa = GSL_Assert_Priority,
+			message = "User_Account_RTDB operation error"
+				: string( @.failure_reason ))
+		set Reserve_Result.result = FAIL
+		set Reserve_Result.message = "reserve failed - system error"
+		next event Reserve_Result
+		return
+	end if
+
+	# user_id not found
+	set Reserve_Result.result = FAIL
+	set Reserve_Result.message = "reserve failed - invalid account"
+	next event Reserve_Result
+	return
+end event User_Account_RTDB!read_failed
+
+event C_S!Reserve_Ticket
+	set Reserve_Ticket.session_id = BCI_session_id
+	set Reserve_Ticket.user_id = BCI_user_id
+	set Reserve_Ticket.ticket_id = BCI_ticket_id
+	set Reserve_Ticket.ticket_num = BCI_ticket_num
+	xp_send(to =xp_dest_query(), event = Reserve_Ticket, ack = true)
+end event
+
+event Reserve_Ticket_success 
+	set Reserve_Result.result = SUCCESS
+	set Reserve_Result.message = "reserve success "
+	next event Reserve_Result
+end event
+
+event Reserve_Ticket_failed 
+	set Reserve_Result.result = FAIL
+	set Reserve_Result.message = "reserve failed -server failed"
+	next event Reserve_Result
+end event
+
+event Reserve_Result
+dynamic
+	Reserve_Dataview_Rec			reserve_fields
+	Reserve_Dataview_Present			reserve_present
+end dynamic
+	set Reserve_Dataview_Rec.result_code = @.result
+	set Reserve_Dataview_Rec.message = @.message
+	set Reserve_Dataview_Present.result_code
+	set Reserve_Dataview_Present.message
+	set Glb_Return_Val = reserve!send_read_completed(
+		BCI_instance, BCI_request_id,
+		Reserve_Dataview_Rec, Reserve_Dataview_Present )
+
+	next event End_Call
+	return
+end event Reserve_Result
+
+event End_Call
+	end_call
+end event End_Call
+
+end fsm RESERVE
+###########################################################################
+# FSM PAY
+###########################################################################
+fsm PAY
+access
+	Pay_Dataview			routing_string
+end access
+
+call_dynamic
+	BCI_user_id				string
+	BCI_instance				counter
+	BCI_request_id				counter
+	BCI_session_id				long_counter
+	BCI_Timestamp			counter
+end call_dynamic
+
+dynamic
+	#--------------------------------------------------------------------------
+	# FSM REGISTER Event Definitions
+	#--------------------------------------------------------------------------
+	Command_Parsing				def_event {
+		text			string,
+	}
+
+	Account_Retrive					def_event {
+		phone			string,
+	}
+
+	Account_Verification					def_event {
+		passwd			string,
+	}
+
+	Update_Session						def_event {
+		session_id		long_counter,
+	}
+	DO_Pay 	def_event{
+	}
+	Delete_Session	def_event{
+	}
+	Pay_Result				def_event {
+		result			Result_Code,
+		message			string
+	}
+
+	End_Call				def_event {}
+
+end dynamic
+
+initialize
+	if Pay_Dataview != ""
+	then
+		set Glb_Pay_Dataview_Info.name = Pay_Dataview
+		set Glb_Return_Val = pay!attach_owner( Pay_Dataview )
+
+		if Glb_Return_Val == e_a_okay
+		then
+			set Glb_Pay_Dataview_Info.instance =
+				pay!get_instance ( Pay_Dataview )
+		else	# attach_owner failed
+			set Glb_Pay_Dataview_Info.instance = 0
+		end if
+
+		if Glb_Return_Val == 0
+		then
+			print(Pay_Dataview : ": dataview attach failed!\n")
+		end if
+	end if
+end initialize
+
+#-------------------------------------------------------------------------------
+# Dataview Request Handlers
+#
+# Description	: Dataview handler that accepts Input Messages (IM's), handles
+#		  the request, and reports status with a corresponding Output
+#		  Message (OM).
+#-------------------------------------------------------------------------------
+event pay!read_received
+	if Glb_Pay_Dataview_Info.instance == 0
+	then
+		print(Pay_Dataview : ": dataview not running!\n")
+		set Glb_Return_Val = pay!send_read_failed(
+			@.instance, @.request_id, e_application_error)
+		next event End_Call
+		return
+	end if
+
+	set BCI_instance = @.instance
+	set BCI_request_id = @.request_id
+
+	set Command_Parsing.text = @.text
+	next event Command_Parsing
+	return
+end event pay!read_received
+
+event Command_Parsing
+dynamic
+	Parse_Result				Parse_Result_rec
+	Head					string
+	Remainder				string
+	Option					string
+	Value					string
+end dynamic
+	set Remainder = map( @.text, a_z:" ", A_Z )
+	set Parse_Result = Parse( ":", @.text)
+	set Head = Parse_Result.head
+	set Remainder = Parse_Result.tail
+	test Head
+	case "PAY"
+		# Get Options
+		while Remainder != ""
+		do
+			set Parse_Result = Parse( ",", Remainder )
+			set Head = Parse_Result.head
+			set Remainder = Parse_Result.tail
+			set Parse_Result = Parse( "=", Head )
+			set Option = Parse_Result.head
+			set Value = Parse_Result.tail
+			test Option
+			case "USER"
+				set BCI_user_id = Value
+			case "SESSION"
+				set BCI_session_id =  long_counter( Value )			
+			other	
+				# Option not recognized
+				set Pay_Result.result = FAIL
+				set Pay_Result.message = Option :
+					": option not recognized"
+				next event Pay_Result
+				return
+			end test
+		end while
+		next event DO_Pay
+		return
+	other
+		set Pay_Result.result = FAIL
+		set Pay_Result.message = Head : ": command not recognized"
+		next event Pay_Result
+		return
+	end test
+			
+end event Command_Parsing
+
+event DO_Pay
+	if BCI_user_id == "" || BCI_session_id == 0
+	then
+		set Pay_Result.result = FAIL
+		set Pay_Result.message = "input error"
+		next event Pay_Result
+		return
+	end if
+	set Update_Session.session_id = BCI_session_id
+	next event Update_Session
+end event DO_Pay
+
+event Update_Session
+	Session_RTDB!read( instance = Glb_Session_RTDB, Session_ID = @.session_id)	
+end event
+
+event Session_RTDB!read_completed
+dynamic
+	Local_Session_Info	Session_RTDB_fields
+	Local_Session_present	Session_RTDB_present	
+end dynamic
+	set Local_Session_Info = @.data
+	set Local_Session_Info.Last_Active_TS = clock()
+	Session_RTDB!update(instance = Glb_Session_RTDB, data = Local_Session_Info)
+end event
+
+event Session_RTDB!read_failed
+	if @.failure_reason != e_tuple_not_found
+	then 
+		send_om( msg_class = GSL_Assert_Message_Class,
+			title = Glb_RTDB_Operation_Assert_Title,
+			poa = GSL_Assert_Priority,
+			message = " Session_RTDB!read_failed"
+				: string( @.failure_reason ))
+		set Pay_Result.result = FAIL
+		set Pay_Result.message = "reserve failed - system error"
+		next event Pay_Result
+		return
+	end if
+end event
+
+event Session_RTDB!update_completed
+	User_Account_RTDB!read(instance = Glb_Session_RTDB, User_ID = BCI_user_id)
+end event
+
+event Session_RTDB!update_failed
+	send_om( msg_class = GSL_Assert_Message_Class,
+		title = Glb_RTDB_Operation_Assert_Title,
+		poa = GSL_Assert_Priority,
+		message = "Session_RTDB!update_failed  error"
+			: string( @.failure_reason ))
+	set Pay_Result.result = FAIL
+	set Pay_Result.message = "reserve failed - system error"
+	next event Pay_Result
+	return
+end event
+
+event Pay_Result
+dynamic
+	Pay_Dataview_Rec			pay_fields
+	Pay_Dataview_Present			pay_present
+end dynamic
+	set Pay_Dataview_Rec.result_code = @.result
+	set Pay_Dataview_Rec.message = @.message
+	set Pay_Dataview_Present.result_code
+	set Pay_Dataview_Present.message
+	set Glb_Return_Val = pay!send_read_completed(
+		BCI_instance, BCI_request_id,
+		Pay_Dataview_Rec, Pay_Dataview_Present )
+
+	next event End_Call
+	return
+end event Pay_Result
+
+event End_Call
+	end_call
+end event End_Call
+
+end fsm PAY
+###########################################################################
+# FSM LOGOUT
+###########################################################################
+fsm LOGOUT
+access
+	Logout_Dataview			routing_string
+end access
+
+call_dynamic
+	BCI_user_id				string
+	BCI_instance				counter
+	BCI_request_id				counter
+	BCI_session_id				long_counter
+	BCI_Timestamp			counter
+end call_dynamic
+
+dynamic
+	#--------------------------------------------------------------------------
+	# FSM REGISTER Event Definitions
+	#--------------------------------------------------------------------------
+	Command_Parsing				def_event {
+		text			string,
+	}
+
+	Account_Retrive					def_event {
+		phone			string,
+	}
+
+	Account_Verification					def_event {
+		passwd			string,
+	}
+
+	Update_Session						def_event {
+		session_id		long_counter,
+	}
+	DO_Logout 	def_event{
+	}
+	Delete_Session	def_event{
+		session_id		long_counter,
+	}
+	Logout_Result				def_event {
+		result			Result_Code,
+		message			string
+	}
+
+	End_Call				def_event {}
+
+end dynamic
+
+initialize
+	if Logout_Dataview != ""
+	then
+		set Glb_Logout_Dataview_Info.name = Logout_Dataview
+		set Glb_Return_Val = logout!attach_owner( Logout_Dataview )
+
+		if Glb_Return_Val == e_a_okay
+		then
+			set Glb_Logout_Dataview_Info.instance =
+				logout!get_instance ( Logout_Dataview )
+		else	# attach_owner failed
+			set Glb_Logout_Dataview_Info.instance = 0
+		end if
+
+		if Glb_Return_Val == 0
+		then
+			print(Logout_Dataview : ": dataview attach failed!\n")
+		end if
+	end if
+end initialize
+
+#-------------------------------------------------------------------------------
+# Dataview Request Handlers
+#
+# Description	: Dataview handler that accepts Input Messages (IM's), handles
+#		  the request, and reports status with a corresponding Output
+#		  Message (OM).
+#-------------------------------------------------------------------------------
+event logout!read_received
+	if Glb_Logout_Dataview_Info.instance == 0
+	then
+		print(Logout_Dataview : ": dataview not running!\n")
+		set Glb_Return_Val = logout!send_read_failed(
+			@.instance, @.request_id, e_application_error)
+		next event End_Call
+		return
+	end if
+
+	set BCI_instance = @.instance
+	set BCI_request_id = @.request_id
+
+	set Command_Parsing.text = @.text
+	next event Command_Parsing
+	return
+end event logout!read_received
+
+event Command_Parsing
+dynamic
+	Parse_Result				Parse_Result_rec
+	Head					string
+	Remainder				string
+	Option					string
+	Value					string
+end dynamic
+	set Remainder = map( @.text, a_z:" ", A_Z )
+	set Parse_Result = Parse( ":", @.text)
+	set Head = Parse_Result.head
+	set Remainder = Parse_Result.tail
+	test Head
+	case "LOGOUT"
+		# Get Options
+		while Remainder != ""
+		do
+			set Parse_Result = Parse( ",", Remainder )
+			set Head = Parse_Result.head
+			set Remainder = Parse_Result.tail
+			set Parse_Result = Parse( "=", Head )
+			set Option = Parse_Result.head
+			set Value = Parse_Result.tail
+			test Option
+			case "USER"
+				set BCI_user_id = Value
+			case "SESSION"
+				set BCI_session_id =  long_counter( Value )			
+			other	
+				# Option not recognized
+				set Logout_Result.result = FAIL
+				set Logout_Result.message = Option :
+					": option not recognized"
+				next event Logout_Result
+				return
+			end test
+		end while
+		next event DO_Logout
+		return
+	other
+		set Logout_Result.result = FAIL
+		set Logout_Result.message = Head : ": command not recognized"
+		next event Logout_Result
+		return
+	end test
+			
+end event Command_Parsing
+
+event DO_Logout
+	if BCI_user_id == "" || BCI_session_id == 0
+	then
+		set Logout_Result.result = FAIL
+		set Logout_Result.message = "input error"
+		next event Logout_Result
+		return
+	end if
+	set Delete_Session.session_id = BCI_session_id
+	next event Delete_Session
+end event DO_Logout
+
+event Delete_Session
+	Session_RTDB!delete( instance = Glb_Session_RTDB, Session_ID = BCI_session_id)	
+end event
+
+event Session_RTDB!delete_completed
+	set Logout_Result.result = SUCCESS
+	set Logout_Result.message = "reserve success "
+	next event Logout_Result
+end event
+
+event Session_RTDB!delete_failed
+	if @.failure_reason != e_tuple_not_found
+	then 
+		send_om( msg_class = GSL_Assert_Message_Class,
+			title = Glb_RTDB_Operation_Assert_Title,
+			poa = GSL_Assert_Priority,
+			message = " Session_RTDB!delete_failed"
+				: string( @.failure_reason ))
+		set Logout_Result.result = FAIL
+		set Logout_Result.message = "logout failed - system error"
+		next event Logout_Result
+		return
+	end if
+end event
+
+event Logout_Result
+dynamic
+	Logout_Dataview_Rec			logout_fields
+	Logout_Dataview_Present			logout_present
+end dynamic
+	set Logout_Dataview_Rec.result_code = @.result
+	set Logout_Dataview_Rec.message = @.message
+	set Logout_Dataview_Present.result_code
+	set Logout_Dataview_Present.message
+	set Glb_Return_Val = logout!send_read_completed(
+		BCI_instance, BCI_request_id,
+		Logout_Dataview_Rec, Logout_Dataview_Present )
+
+	next event End_Call
+	return
+end event Logout_Result
+
+event End_Call
+	end_call
+end event End_Call
+
+end fsm LOGOUT
+
+###########################################################################
+# FSM QUERY
+###########################################################################
+fsm QUERY
+access
+	Query_Dataview			routing_string
+end access
+
+call_dynamic
+	BCI_user_id				string
+	BCI_instance				counter
+	BCI_request_id				counter
+	BCI_session_id				long_counter
+	BCI_Timestamp			counter
+end call_dynamic
+
+dynamic
+	#--------------------------------------------------------------------------
+	# FSM REGISTER Event Definitions
+	#--------------------------------------------------------------------------
+	Command_Parsing				def_event {
+		text			string,
+	}
+
+	Account_Retrive					def_event {
+		phone			string,
+	}
+
+	Account_Verification					def_event {
+		passwd			string,
+	}
+
+	Update_Session						def_event {
+		session_id		long_counter,
+	}
+	DO_Query 	def_event{
+	}
+	Delete_Session	def_event{
+	}
+	Query_Result				def_event {
+		result			Result_Code,
+		message			string
+	}
+
+	End_Call				def_event {}
+
+end dynamic
+
+initialize
+	if Query_Dataview != ""
+	then
+		set Glb_Query_Dataview_Info.name = Query_Dataview
+		set Glb_Return_Val = query!attach_owner( Query_Dataview )
+
+		if Glb_Return_Val == e_a_okay
+		then
+			set Glb_Query_Dataview_Info.instance =
+				query!get_instance ( Query_Dataview )
+		else	# attach_owner failed
+			set Glb_Query_Dataview_Info.instance = 0
+		end if
+
+		if Glb_Return_Val == 0
+		then
+			print(Query_Dataview : ": dataview attach failed!\n")
+		end if
+	end if
+end initialize
+
+#-------------------------------------------------------------------------------
+# Dataview Request Handlers
+#
+# Description	: Dataview handler that accepts Input Messages (IM's), handles
+#		  the request, and reports status with a corresponding Output
+#		  Message (OM).
+#-------------------------------------------------------------------------------
+event query!read_received
+	if Glb_Query_Dataview_Info.instance == 0
+	then
+		print(Query_Dataview : ": dataview not running!\n")
+		set Glb_Return_Val = query!send_read_failed(
+			@.instance, @.request_id, e_application_error)
+		next event End_Call
+		return
+	end if
+
+	set BCI_instance = @.instance
+	set BCI_request_id = @.request_id
+
+	set Command_Parsing.text = @.text
+	next event Command_Parsing
+	return
+end event query!read_received
+
+event Command_Parsing
+dynamic
+	Parse_Result				Parse_Result_rec
+	Head					string
+	Remainder				string
+	Option					string
+	Value					string
+end dynamic
+	set Remainder = map( @.text, a_z:" ", A_Z )
+	set Parse_Result = Parse( ":", @.text)
+	set Head = Parse_Result.head
+	set Remainder = Parse_Result.tail
+	test Head
+	case "QUERY"
+		# Get Options
+		while Remainder != ""
+		do
+			set Parse_Result = Parse( ",", Remainder )
+			set Head = Parse_Result.head
+			set Remainder = Parse_Result.tail
+			set Parse_Result = Parse( "=", Head )
+			set Option = Parse_Result.head
+			set Value = Parse_Result.tail
+			test Option
+			case "USER"
+				set BCI_user_id = Value
+			case "SESSION"
+				set BCI_session_id =  long_counter( Value )			
+			other	
+				# Option not recognized
+				set Query_Result.result = FAIL
+				set Query_Result.message = Option :
+					": option not recognized"
+				next event Query_Result
+				return
+			end test
+		end while
+		next event DO_Query
+		return
+	other
+		set Query_Result.result = FAIL
+		set Query_Result.message = Head : ": command not recognized"
+		next event Query_Result
+		return
+	end test
+			
+end event Command_Parsing
+
+event DO_Query
+	if BCI_user_id == "" || BCI_session_id == 0
+	then
+		set Query_Result.result = FAIL
+		set Query_Result.message = "input error"
+		next event Query_Result
+		return
+	end if
+	set Update_Session.session_id = BCI_session_id
+	next event Update_Session
+end event DO_Query
+
+event Update_Session
+	Session_RTDB!read( instance = Glb_Session_RTDB, Session_ID = @.session_id)	
+end event
+
+event Session_RTDB!read_completed
+dynamic
+	Local_Session_Info	Session_RTDB_fields
+	Local_Session_present	Session_RTDB_present	
+end dynamic
+	set Local_Session_Info = @.data
+	set Local_Session_Info.Last_Active_TS = clock()
+	Session_RTDB!update(instance = Glb_Session_RTDB, data = Local_Session_Info)
+end event
+
+event Session_RTDB!read_failed
+	if @.failure_reason != e_tuple_not_found
+	then 
+		send_om( msg_class = GSL_Assert_Message_Class,
+			title = Glb_RTDB_Operation_Assert_Title,
+			poa = GSL_Assert_Priority,
+			message = " Session_RTDB!read_failed"
+				: string( @.failure_reason ))
+		set Query_Result.result = FAIL
+		set Query_Result.message = "reserve failed - system error"
+		next event Query_Result
+		return
+	end if
+end event
+
+event Session_RTDB!update_completed
+	User_Account_RTDB!read(instance = Glb_Session_RTDB, User_ID = BCI_user_id)
+end event
+
+event Session_RTDB!update_failed
+	send_om( msg_class = GSL_Assert_Message_Class,
+		title = Glb_RTDB_Operation_Assert_Title,
+		poa = GSL_Assert_Priority,
+		message = "Session_RTDB!update_failed  error"
+			: string( @.failure_reason ))
+	set Query_Result.result = FAIL
+	set Query_Result.message = "reserve failed - system error"
+	next event Query_Result
+	return
+end event
+
+event Query_Result
+dynamic
+	Query_Dataview_Rec			query_fields
+	Query_Dataview_Present			query_present
+end dynamic
+	set Query_Dataview_Rec.result_code = @.result
+	set Query_Dataview_Rec.message = @.message
+	set Query_Dataview_Present.result_code
+	set Query_Dataview_Present.message
+	set Glb_Return_Val = query!send_read_completed(
+		BCI_instance, BCI_request_id,
+		Query_Dataview_Rec, Query_Dataview_Present )
+
+	next event End_Call
+	return
+end event Query_Result
+
+event End_Call
+	end_call
+end event End_Call
+
+end fsm QUERY
+
+###########################################################################
+# FSM REFUND
+###########################################################################
+fsm REFUND
+access
+	Refund_Dataview			routing_string
+end access
+
+call_dynamic
+	BCI_user_id				string
+	BCI_instance				counter
+	BCI_request_id				counter
+	BCI_session_id				long_counter
+	BCI_Timestamp			counter
+end call_dynamic
+
+dynamic
+	#--------------------------------------------------------------------------
+	# FSM REGISTER Event Definitions
+	#--------------------------------------------------------------------------
+	Command_Parsing				def_event {
+		text			string,
+	}
+
+	Account_Retrive					def_event {
+		phone			string,
+	}
+
+	Account_Verification					def_event {
+		passwd			string,
+	}
+
+	Update_Session						def_event {
+		session_id		long_counter,
+	}
+	DO_Refund 	def_event{
+	}
+	Delete_Session	def_event{
+	}
+	Refund_Result				def_event {
+		result			Result_Code,
+		message			string
+	}
+
+	End_Call				def_event {}
+
+end dynamic
+
+initialize
+	if Refund_Dataview != ""
+	then
+		set Glb_Refund_Dataview_Info.name = Refund_Dataview
+		set Glb_Return_Val = refund!attach_owner( Refund_Dataview )
+
+		if Glb_Return_Val == e_a_okay
+		then
+			set Glb_Refund_Dataview_Info.instance =
+				refund!get_instance ( Refund_Dataview )
+		else	# attach_owner failed
+			set Glb_Refund_Dataview_Info.instance = 0
+		end if
+
+		if Glb_Return_Val == 0
+		then
+			print(Refund_Dataview : ": dataview attach failed!\n")
+		end if
+	end if
+end initialize
+
+#-------------------------------------------------------------------------------
+# Dataview Request Handlers
+#
+# Description	: Dataview handler that accepts Input Messages (IM's), handles
+#		  the request, and reports status with a corresponding Output
+#		  Message (OM).
+#-------------------------------------------------------------------------------
+event refund!read_received
+	if Glb_Refund_Dataview_Info.instance == 0
+	then
+		print(Refund_Dataview : ": dataview not running!\n")
+		set Glb_Return_Val = refund!send_read_failed(
+			@.instance, @.request_id, e_application_error)
+		next event End_Call
+		return
+	end if
+
+	set BCI_instance = @.instance
+	set BCI_request_id = @.request_id
+
+	set Command_Parsing.text = @.text
+	next event Command_Parsing
+	return
+end event refund!read_received
+
+event Command_Parsing
+dynamic
+	Parse_Result				Parse_Result_rec
+	Head					string
+	Remainder				string
+	Option					string
+	Value					string
+end dynamic
+	set Remainder = map( @.text, a_z:" ", A_Z )
+	set Parse_Result = Parse( ":", @.text)
+	set Head = Parse_Result.head
+	set Remainder = Parse_Result.tail
+	test Head
+	case "REFUND"
+		# Get Options
+		while Remainder != ""
+		do
+			set Parse_Result = Parse( ",", Remainder )
+			set Head = Parse_Result.head
+			set Remainder = Parse_Result.tail
+			set Parse_Result = Parse( "=", Head )
+			set Option = Parse_Result.head
+			set Value = Parse_Result.tail
+			test Option
+			case "USER"
+				set BCI_user_id = Value
+			case "SESSION"
+				set BCI_session_id =  long_counter( Value )			
+			other	
+				# Option not recognized
+				set Refund_Result.result = FAIL
+				set Refund_Result.message = Option :
+					": option not recognized"
+				next event Refund_Result
+				return
+			end test
+		end while
+		next event DO_Refund
+		return
+	other
+		set Refund_Result.result = FAIL
+		set Refund_Result.message = Head : ": command not recognized"
+		next event Refund_Result
+		return
+	end test
+			
+end event Command_Parsing
+
+event DO_Refund
+	if BCI_user_id == "" || BCI_session_id == 0
+	then
+		set Refund_Result.result = FAIL
+		set Refund_Result.message = "input error"
+		next event Refund_Result
+		return
+	end if
+	set Update_Session.session_id = BCI_session_id
+	next event Update_Session
+end event DO_Refund
+
+event Update_Session
+	Session_RTDB!read( instance = Glb_Session_RTDB, Session_ID = @.session_id)	
+end event
+
+event Session_RTDB!read_completed
+dynamic
+	Local_Session_Info	Session_RTDB_fields
+	Local_Session_present	Session_RTDB_present	
+end dynamic
+	set Local_Session_Info = @.data
+	set Local_Session_Info.Last_Active_TS = clock()
+	Session_RTDB!update(instance = Glb_Session_RTDB, data = Local_Session_Info)
+end event
+
+event Session_RTDB!read_failed
+	if @.failure_reason != e_tuple_not_found
+	then 
+		send_om( msg_class = GSL_Assert_Message_Class,
+			title = Glb_RTDB_Operation_Assert_Title,
+			poa = GSL_Assert_Priority,
+			message = " Session_RTDB!read_failed"
+				: string( @.failure_reason ))
+		set Refund_Result.result = FAIL
+		set Refund_Result.message = "reserve failed - system error"
+		next event Refund_Result
+		return
+	end if
+end event
+
+event Session_RTDB!update_completed
+	User_Account_RTDB!read(instance = Glb_Session_RTDB, User_ID = BCI_user_id)
+end event
+
+event Session_RTDB!update_failed
+	send_om( msg_class = GSL_Assert_Message_Class,
+		title = Glb_RTDB_Operation_Assert_Title,
+		poa = GSL_Assert_Priority,
+		message = "Session_RTDB!update_failed  error"
+			: string( @.failure_reason ))
+	set Refund_Result.result = FAIL
+	set Refund_Result.message = "reserve failed - system error"
+	next event Refund_Result
+	return
+end event
+
+event Refund_Result
+dynamic
+	Refund_Dataview_Rec			refund_fields
+	Refund_Dataview_Present			refund_present
+end dynamic
+	set Refund_Dataview_Rec.result_code = @.result
+	set Refund_Dataview_Rec.message = @.message
+	set Refund_Dataview_Present.result_code
+	set Refund_Dataview_Present.message
+	set Glb_Return_Val = refund!send_read_completed(
+		BCI_instance, BCI_request_id,
+		Refund_Dataview_Rec, Refund_Dataview_Present )
+
+	next event End_Call
+	return
+end event Refund_Result
+
+event End_Call
+	end_call
+end event End_Call
+
+end fsm REFUND
 ###########################################################################
 # FSM SERVICE
 ###########################################################################
