@@ -166,6 +166,17 @@ type
 
 end type
 
+rc
+	# send om parameters
+	GSL_Assert				message_class
+	GSL_Report				message_class
+	GSL_Assert_Priority			priority_of_action
+	GSL_Report_Priority			priority_of_action
+	GSL_Information_Priority		priority_of_action
+	# end semd om parameters
+
+end rc
+
 dynamic
 
 	a_z					string(26)
@@ -177,17 +188,15 @@ dynamic
 	Glb_SPA_NAME				string
 	Glb_Client_ID				counter
 
-	# send om parameters
-	GSL_Assert_Message_Class		message_class
-	GSL_Assert_Priority			priority_of_action
-
+	# send om title
+	Glb_IMOM_Report_Title			string
 	Glb_RTDB_Data_Assert_Title		string
 	Glb_EPAY_RC_Assert_Title		string
 	Glb_Dynamic_Data_Assert_Title		string
 	Glb_Overflow_Assert_Title		string
 	Glb_Internal_Operation_Assert_Title	string
 	Glb_RTDB_Operation_Assert_Title		string
-	# end semd om parameters
+	# end semd om title
 
 	Glb_Request_Dataview_Info		Dataview_Info_rec
 	Glb_Register_Dataview_Info		Dataview_Info_rec
@@ -198,8 +207,8 @@ dynamic
 	Glb_Session_RTDB			counter
 
 	Glb_Test_Access				counter
-	Glb_Test_Init_Time			counter
-	Glb_Test_INIT_TIMESTAMP			counter
+	Glb_LDAP_Init_Time			counter
+	Glb_LDAP_INIT_TIMESTAMP			counter
 
 	######################################################
 	# Inter-Fsm events
@@ -311,7 +320,8 @@ dynamic
 end dynamic
 
 initialize
-	schedule( clock = clock() + 5,
+	set Glb_LDAP_INIT_TIMESTAMP = clock()
+	schedule( clock = clock() + 3,
 		to = customer_index(),
 		event = Dataview_Init )
 end initialize
@@ -332,7 +342,11 @@ event Dataview_Init
 
 		if Glb_Request_Dataview_Info.instance == 0
 		then
-			print( Glb_Request_Dataview_Info.name : ": dataview attach failed!\n")
+			schedule( clock = clock() + 3,
+				event = Dataview_Init )
+		else
+			set Glb_Request_Dataview_Info.is_attached
+			set Glb_LDAP_Init_Time = clock() - Glb_LDAP_INIT_TIMESTAMP
 		end if
 	end if
 
@@ -475,7 +489,6 @@ dynamic
 end dynamic
 
 initialize
-	set Glb_Test_INIT_TIMESTAMP = clock()
 	schedule( clock = clock() + 3,
 		to = customer_index(),
 		event = Test_Init )
@@ -486,8 +499,6 @@ event Test_Init
 	if Glb_Test_Access == 0
 	then
 		schedule( clock = clock() + 3, event = Test_Init )
-	else
-		set Glb_Test_Init_Time = clock() - Glb_Test_INIT_TIMESTAMP
 	end if
 	end_call
 end event Test_Init
@@ -542,6 +553,7 @@ dynamic
 
 	End_Call				def_event {}
 end dynamic
+
 #-------------------------------------------------------------------------------
 # Event		: usli_request
 #
@@ -621,29 +633,32 @@ dynamic
 	Request_Dataview_Present		request_present
 end dynamic
 
-	if @.result == SUCCESS
-	then
-		send_usli_response(transaction_id = BCI_transaction_id, code = "OK",text = "Request succeeded! Content=":@.message)
-	else
-		send_usli_response(transaction_id = BCI_transaction_id, code = "NG",text = "Request failed! Content=":@.message)
-	end if
+#	if @.result == SUCCESS
+#	then
+#		send_usli_response(transaction_id = BCI_transaction_id, code = "OK",text = "Request succeeded! Content=":@.message)
+#	else
+#		send_usli_response(transaction_id = BCI_transaction_id, code = "NG",text = "Request failed! Content=":@.message)
+#	end if
+	send_om( msg_class = GSL_Report, poa = GSL_Report_Priority,
+		title = Glb_IMOM_Report_Title,
+		message = @.message )
 	next event End_Call
 	return
 end event Request_Result
 
-# send usli_response success event
-event usli_response_succeeded
-	print ("\n usli_request success: ", @)
-	next event End_Call
-	return
-end event usli_response_succeeded
+## send usli_response success event
+#event usli_response_succeeded
+#	print ("\n usli_request success: ", @)
+#	next event End_Call
+#	return
+#end event usli_response_succeeded
 
-# send usli_response fail
-event usli_response_failed
-	print ("\n usli_request failed: ", @)
-	next event End_Call
-	return
-end event usli_response_failed
+## send usli_response fail
+#event usli_response_failed
+#	print ("\n usli_request failed: ", @)
+#	next event End_Call
+#	return
+#end event usli_response_failed
 
 event End_Call
 	print("IMOM end call")
